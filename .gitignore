@@ -1,0 +1,21 @@
+# --- secrets: never commit ---
+.env
+credentials.json
+*.pem
+*.key
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- local junk ---
+artifacts/
+capsolver_ext/
+Claude outputs/
+*.docx
+
+# --- internal planning, not for the repo ---
+PLAN-*.md
+ClusterPulse-RU.md
