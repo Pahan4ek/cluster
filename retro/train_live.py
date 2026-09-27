@@ -11,7 +11,15 @@ copaid_w5 выкинут: в логах нет подписанта транза
 Токены, вышедшие на AMM, в цели считаются «не ловушкой»: фазу AMM мы пока
 не видим, это известная дыра.
 
-    python retro/train_live.py            -> model/live_model.json
+    python retro/train_live.py                 -> model/live_model_new.json (+ model/fork_a.txt)
+    python retro/train_live.py --target old    выбрать цель вручную (old | new), по умолчанию — стабильнее по неделям
+    python retro/train_live.py --out model/live_model.json   сразу в бой (скорер читает этот файл)
+
+Цели:
+  old — розница на НЕ вышедшем токене теряет больше половины денег (ROI < -50%);
+  new — больше половины розничных кошельков потеряли больше половины вложенного
+        (rest_losers50 / rest_n >= 0.5). Боты (300+ запусков в день) в розницу не входят.
+Данные: dune_out/censusL_*.csv (урезанная перепись, retro/census_run.py); старые census_* не читаются.
 
 Проверка: учимся на неделях 1-3, проверяем на 4-й. Финальная модель
 обучается на всём месяце.
@@ -45,13 +53,15 @@ BINS = {"dev_supply": [0, .001, .03, .1, .3, 1], "nondev_s0": [0, .001, .03, .1,
         "mayhem": [-.5, .5, 1.5], "n_wal_10s": [-.5, 2, 5, 10, 1e5], "net_supply_10s": [-1, .03, .1, .3, 1]}
 COLS = ["mint", "c_time", "g_time", "n_tr", "peak_mc", "s0_supply", "dev_supply", "s2_supply", "s0_buyers",
         "multi_tx", "max_wal_per_tx", "dev_prev_30d", "dev_prev_grad", "sym_before_other", "mayhem",
-        "n_wal_10s", "net_supply_10s", "rest_n", "rest_spent", "rest_net"]
+        "n_wal_10s", "net_supply_10s", "rest_n", "rest_spent", "rest_net", "rest_losers50"]
+TARGETS = {"old": "розница на не вышедшем токене теряет >50% денег",
+           "new": "больше половины розничных кошельков потеряли >50% вложенного"}
 
 
 def load():
-    files = sorted(glob.glob(str(OUT / "census_2026-*.csv*")))
+    files = sorted(glob.glob(str(OUT / "censusL_2026-*.csv*")))
     if not files:
-        sys.exit(f"[FATAL] нет файлов census_* в {OUT}")
+        sys.exit(f"[FATAL] нет файлов censusL_* в {OUT} — python retro/census_run.py <от> <до>")
     d = pd.concat([pd.read_csv(f, usecols=COLS) for f in files], ignore_index=True).drop_duplicates("mint")
     d = d[d.n_tr.notna() & (d.peak_mc > 0)].copy()                 # были сделки, котировка в SOL
     d["c_time"] = pd.to_datetime(d.c_time.str.replace(" UTC", ""), utc=True)
@@ -66,7 +76,8 @@ def load():
     # были внешние покупатели с деньгами (иначе ловушки не было и быть не могло)
     d = d[(z("rest_n") > 0) & (z("rest_spent") >= MIN_RETAIL_SOL)].copy()
     roi = d.rest_net / d.rest_spent.replace(0, np.nan)
-    d["trap"] = (~d.grad) & (roi < -0.5)
+    d["trap_old"] = (~d.grad) & (roi < -0.5)
+    d["trap_new"] = z("rest_losers50") / z("rest_n") >= 0.5
     d["week"] = ((d.c_time - d.c_time.min().normalize()).dt.days // 7).clip(upper=3)
     return d
 
@@ -90,9 +101,89 @@ def export(m, path, meta):
     Path(path).write_text(json.dumps(obj, separators=(",", ":")), encoding="utf-8")
 
 
+def weekly_auc(d, y_col, feats=None):
+    """AUC по неделям 1..3: учимся на всём, что раньше недели минус 3 дня (зазор метки)."""
+    feats = feats or FEATURES
+    out = []
+    for w in (1, 2, 3):
+        te = d[d.week == w]
+        tr = d[d.c_time < te.c_time.min() - pd.Timedelta(days=3)]
+        if len(tr) < 2000 or te[y_col].nunique() < 2:
+            continue
+        m = fit(tr[feats], tr[y_col])
+        out.append(roc_auc_score(te[y_col], m.predict_proba(te[feats])[:, 1]))
+    return out
+
+
+def fork_a(d, y_col, lines):
+    """Развилка A: кластерные корзины на метке без ботов + AUC без mayhem на отложенной неделе."""
+    base = d[y_col].mean()
+    lines.append(f"цель {y_col}: база {base:.3f}, n={len(d):,}")
+    ok_bins = True
+    for name, m in [("multi_tx >= 2", d.multi_tx.fillna(0) >= 2),
+                    ("max_wal_per_tx >= 3", d.max_wal_per_tx.fillna(0) >= 3),
+                    ("nondev_s0 > 0.1", d.nondev_s0 > 0.1)]:
+        n, r = int(m.sum()), float(d.loc[m, y_col].mean()) if m.any() else float("nan")
+        passed = n >= 500 and r >= 1.5 * base
+        ok_bins &= passed
+        lines.append(f"  {name:22s} n={n:>6,}  ловушек {r:.3f}  = {r/base:.2f}× базы  {'OK' if passed else 'нет'}")
+    fe = [f for f in FEATURES if f != "mayhem"]
+    te = d[d.week == 3]
+    tr = d[d.c_time < te.c_time.min() - pd.Timedelta(days=3)]
+    m = fit(tr[fe], tr[y_col])
+    p = m.predict_proba(te[fe])[:, 1]
+    auc = roc_auc_score(te[y_col], p)
+    nm = (te.mayhem == 0).values
+    auc_nm = roc_auc_score(te[y_col].values[nm], p[nm]) if te[y_col].values[nm].std() > 0 else float("nan")
+    lines.append(f"  AUC без mayhem на неделе 4: {auc:.3f} (только не-mayhem запуски: {auc_nm:.3f})  "
+                 f"{'OK' if auc >= 0.75 else 'нет'}")
+    for mh in (0, 1):
+        x = d[d.mayhem == mh]
+        lines.append(f"  mayhem={mh}: n={len(x):,} ловушек {x[y_col].mean():.3f}")
+    verdict = ok_bins and auc >= 0.75
+    lines.append(f"  => развилка A: {'ДА — питч «детектор кластеров»' if verdict else 'НЕТ — питч «риск-скор за 10 секунд»'}")
+    return verdict
+
+
+def dirty_mayhem(lines):
+    """Доля ловушек (цель old) mayhem / не-mayhem ДО чистки от ботов — по старой переписи в dune_out/old/."""
+    files = sorted(glob.glob(str(OUT / "old" / "census_2026-*.csv*")))
+    if not files:
+        return
+    cols = ["mint", "g_time", "n_tr", "peak_mc", "mayhem", "rest_n", "rest_spent", "rest_net"]
+    o = pd.concat([pd.read_csv(f, usecols=cols) for f in files], ignore_index=True).drop_duplicates("mint")
+    o = o[o.n_tr.notna() & (o.peak_mc > 0) & (o.rest_n.fillna(0) > 0) & (o.rest_spent.fillna(0) >= MIN_RETAIL_SOL)]
+    o["trap"] = o.g_time.isna() & (o.rest_net / o.rest_spent < -0.5)
+    o["mh"] = o.mayhem.astype(str).str.lower().eq("true")
+    lines.append(f"до чистки (старая перепись, цель old): n={len(o):,} база {o.trap.mean():.3f} | "
+                 f"mayhem {o[o.mh].trap.mean():.3f} (n={o.mh.sum():,}) | не-mayhem {o[~o.mh].trap.mean():.3f}")
+
+
 def main():
+    arg = lambda k, dflt=None: sys.argv[sys.argv.index(k) + 1] if k in sys.argv else dflt
+    out_path = Path(arg("--out", MODEL_DIR / "live_model_new.json"))
     d = load()
     print(f"запусков с внешней розницей: {len(d):,}  ({d.c_time.min():%d.%m}–{d.c_time.max():%d.%m})")
+    lines = []
+    stab = {}
+    for t in ("old", "new"):
+        a = weekly_auc(d, f"trap_{t}")
+        stab[t] = a
+        lines.append(f"цель {t}: база {d[f'trap_{t}'].mean():.3f} | AUC по неделям 2-4: "
+                     + ", ".join(f"{x:.3f}" for x in a)
+                     + (f" | среднее {np.mean(a):.3f}, разброс {np.std(a):.3f}" if a else ""))
+    target = arg("--target")
+    if target is None:
+        # стабильнее = меньше разброс; при разнице < 0.005 — выше среднее
+        so = {t: (np.std(a) if a else 9, -np.mean(a) if a else 0) for t, a in stab.items()}
+        target = min(so, key=lambda t: (round(so[t][0] / 0.005), so[t][1]))
+    lines.append(f"выбрана цель: {target} — {TARGETS[target]}")
+    d["trap"] = d[f"trap_{target}"]
+    lines.append("")
+    fork_a(d, "trap", lines)
+    dirty_mayhem(lines)
+    print("\n".join(lines))
+    (MODEL_DIR / "fork_a.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"доля ловушек: {d.trap.mean():.3f}")
 
     te = d[d.week == 3]
@@ -135,13 +226,13 @@ def main():
            for k, m_ in bands.items()}
     for k, v in roi.items():
         print(f"  {k:6s}: запусков {v['n']:>6,} | розница вложила {v['retail_sol']:>9,.0f} SOL | ROI {v['retail_roi']:+.1%}")
-    meta = {"target": "розница на не вышедшем токене теряет >50%", "base_rate": float(d.trap.mean()),
+    meta = {"target": TARGETS[target], "target_key": target, "base_rate": float(d.trap.mean()),
             "holdout": {"auc": float(auc), "top10": float(y[top10].mean()), "top2": float(y[top2].mean()),
                         "base": float(y.mean()), "n": int(len(y))},
             "thresholds": q_final, "thresholds_holdout_model": q, "precision_at": prec, "explain": expl, "roi_by_level": roi,
             "min_retail_sol": MIN_RETAIL_SOL,
             "trained_on": f"{d.c_time.min():%Y-%m-%d}..{d.c_time.max():%Y-%m-%d}", "n_train": int(len(d))}
-    path = MODEL_DIR / "live_model.json"
+    path = out_path
     export(final, path, meta)
     # самопроверка экспорта
     sys.path.insert(0, str(ROOT))

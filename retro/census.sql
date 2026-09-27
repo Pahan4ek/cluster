@@ -85,6 +85,7 @@ g as (
     sum(case when not is_cr and not is_bot and first_rs > 5 then spent end) as rest_spent,
     count(case when not is_cr and not is_bot and first_rs > 5 then 1 end) as rest_n,
     count(case when not is_cr and not is_bot and first_rs > 5 and net_sol > 0 then 1 end) as rest_winners,
+    count(case when not is_cr and not is_bot and first_rs > 5 and net_sol < -0.5 * spent then 1 end) as rest_losers50,
     sum(case when net_sol > 0 then net_sol else 0 end) as total_profit,
     sum(case when copaid and not is_cr then net_sol end) as copaid_net
   from w group by 1

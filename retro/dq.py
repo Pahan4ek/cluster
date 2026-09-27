@@ -26,9 +26,51 @@ def _key():
 API = "https://api.dune.com/api/v1"
 H = {"X-Dune-Api-Key": _key()}
 
+# --- стоп-кран по кредитам ---------------------------------------------------
+# Бюджет одного «запуска» — BUDGET кредитов от точки отсчёта в dune_out/_budget.json.
+# Упёрлись -> отказ до ручного продления: python retro/dq.py --budget-extend
+BUDGET = 200
+BUDGET_FILE = OUT / "_budget.json"
 
-def run(sql, name=None, performance="medium", timeout_s=1500, quiet=False):
-    r = requests.post(f"{API}/sql/execute", headers=H, json={"sql": sql, "performance": performance}, timeout=60)
+
+def credits_used():
+    r = requests.post(f"{API}/usage", headers=H, json={}, timeout=30)
+    r.raise_for_status()
+    bp = r.json()["billing_periods"][0]
+    return float(bp["credits_used"]), float(bp["credits_included"])
+
+
+def _budget():
+    if BUDGET_FILE.exists():
+        return json.loads(BUDGET_FILE.read_text(encoding="utf-8"))
+    used, _ = credits_used()
+    b = {"base": used, "limit": BUDGET}
+    BUDGET_FILE.write_text(json.dumps(b), encoding="utf-8")
+    return b
+
+
+def spent_report():
+    """Потрачено в запуске: максимум из счётчика Dune (запаздывает) и локальной суммы execution_cost_credits."""
+    b = _budget(); used, incl = credits_used()
+    return max(used - b["base"], b.get("local", 0.0)), b["limit"], used, incl
+
+
+def _add_local(cr, dp):
+    b = _budget(); b["local"] = b.get("local", 0.0) + cr; b["datapoints"] = b.get("datapoints", 0) + dp
+    BUDGET_FILE.write_text(json.dumps(b), encoding="utf-8")
+
+
+def _check():
+    spent, limit, used, incl = spent_report()
+    if spent >= limit:
+        sys.exit(f"[STOP] бюджет запуска исчерпан: {spent:.0f} из {limit} кредитов "
+                 f"(в цикле {used:.0f}/{incl:.0f}). Нужно разрешение Павла, потом --budget-extend")
+    return spent, limit
+
+
+def run(sql, name=None, performance=None, timeout_s=1500, quiet=False):
+    before, limit = _check()
+    r = requests.post(f"{API}/sql/execute", headers=H, json={"sql": sql, **({"performance": performance} if performance else {})}, timeout=60)
     if r.status_code >= 400:
         print("ERR submit", r.status_code, r.text[:500]); return None
     eid = r.json()["execution_id"]
@@ -43,6 +85,10 @@ def run(sql, name=None, performance="medium", timeout_s=1500, quiet=False):
         if time.time() - t0 > timeout_s:
             print("TIMEOUT", eid); return None
         time.sleep(3)
+    md = st.get("result_metadata") or {}
+    _add_local(float(st.get("execution_cost_credits") or 0), int(md.get("datapoint_count") or 0))
+    print(f"-- выполнено: {st.get('execution_cost_credits', 0):.2f} кр, {md.get('total_row_count')} строк, "
+          f"{md.get('datapoint_count')} датапоинтов")
     rows, cols, off = [], None, 0
     while True:
         res = requests.get(f"{API}/execution/{eid}/results", headers=H, params={"limit": 25000, "offset": off}, timeout=180).json()
@@ -53,9 +99,10 @@ def run(sql, name=None, performance="medium", timeout_s=1500, quiet=False):
         if nx is None or nx == off:
             break
         off = nx
-    cost = {k: v for k, v in st.items() if "cost" in k or "credit" in k}
-    if not quiet:
-        print(f"-- {len(rows)} rows, {time.time()-t0:.0f}s {cost}")
+    after, _, used, incl = spent_report()
+    with open(OUT / "_spend.log", "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{name or '-'}\t{len(rows)}\t{after-before:.1f}\t{after:.1f}\n")
+    print(f"-- {len(rows)} rows, {time.time()-t0:.0f}s | запрос {after-before:.1f} кр | запуск {after:.0f}/{limit} | цикл {used:.0f}/{incl:.0f}")
     if name:
         cols = cols or (list(rows[0]) if rows else [])
         with open(OUT / f"{name}.csv", "w", newline="", encoding="utf-8") as f:
@@ -64,11 +111,16 @@ def run(sql, name=None, performance="medium", timeout_s=1500, quiet=False):
 
 
 if __name__ == "__main__":
+    if sys.argv[1] == "--budget":
+        print("запуск: {:.0f} из {} кр | цикл {:.0f}/{:.0f}".format(*spent_report())); sys.exit()
+    if sys.argv[1] == "--budget-extend":
+        b = _budget(); b["limit"] += BUDGET; BUDGET_FILE.write_text(json.dumps(b), encoding="utf-8")
+        print(f"лимит запуска поднят до {b['limit']}"); sys.exit()
     sql = sys.argv[1]
     if sql.startswith("@"):
         sql = open(sql[1:], encoding="utf-8").read()
     name = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "-" else None
-    perf = sys.argv[3] if len(sys.argv) > 3 else "medium"
+    perf = sys.argv[3] if len(sys.argv) > 3 else None
     rows = run(sql, name, perf)
     if rows is not None:
         for r in rows[:int(os.environ.get("SHOW", 60))]:
