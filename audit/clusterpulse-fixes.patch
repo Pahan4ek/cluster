@@ -1,0 +1,675 @@
+diff --git a/.env.example b/.env.example
+index 5c9b63d..e79eeaa 100755
+--- a/.env.example
++++ b/.env.example
+@@ -3,3 +3,10 @@ HELIUS_API_KEY=your_helius_key_here
+ CAPSOLVER_API_KEY=
+ PROXY=
+ DUNE_API_KEY=
++# живой скорер
++TG_BOT_TOKEN=
++TG_CHAT_ID=
++# WS_URL=wss://...        свой WebSocket вместо Helius
++# RPC_URL=https://...     свой RPC для добора обрезанных транзакций
++# DECIDE_AFTER=12
++# MIN_WALLETS_ALERT=3
+diff --git a/.gitignore b/.gitignore
+index dd1d847..83d7d0a 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -29,3 +29,11 @@ live.db*
+ raw*.jsonl
+ launches.db
+ ws_debug*
++
++# --- чужое и тяжёлое: не для репо ClusterPulse ---
++analysis/
++*.bak
++*.db
++*.db-shm
++*.db-wal
++replay/
+diff --git a/funding_graph.py b/funding_graph.py
+index 6d4830a..7bf4204 100755
+--- a/funding_graph.py
++++ b/funding_graph.py
+@@ -19,7 +19,6 @@ if sys.platform == "win32":
+ import requests
+ from rpc import rpc
+ 
+-RPC        = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+ DB         = "launches.db"
+ SYSTEM     = "11111111111111111111111111111111"
+ PAGE       = 1000     # размер страницы getSignaturesForAddress
+diff --git a/live/devdb.py b/live/devdb.py
+index fd46fbe..00c8d9e 100755
+--- a/live/devdb.py
++++ b/live/devdb.py
+@@ -8,7 +8,7 @@ dev_grad_rate считаются ровно как в retro/census.sql.
+ 
+ ВАЖНО: между концом переписи и стартом скорера есть дыра в истории.
+ Пока скорер не проработал ~30 дней непрерывно, счётчики у активных
+-девов занижены. Дыру можно закрыть агрегатным запросом к Dune.
++девов занижены. Дыру закрывает retro/devgap.sql + python -m live.devdb --append <csv>.
+ """
+ import csv
+ import glob
+@@ -123,10 +123,32 @@ def seed(path=DB_PATH):
+           f"за {time.time()-t0:.0f} с; история до {datetime.fromtimestamp(last, timezone.utc):%Y-%m-%d %H:%M} UTC")
+ 
+ 
++def append(csv_path, path=DB_PATH):
++    """Дописать запуски из выгрузки retro/devgap.sql (mint, creator, c_time, g_time).
++    Повторы по mint отсекает уникальный индекс, поэтому пересечение с живыми данными безопасно."""
++    db = DevDB(path)
++    opener = gzip.open if str(csv_path).endswith(".gz") else open
++    rows = []
++    with opener(csv_path, "rt", encoding="utf-8", newline="") as fh:
++        for r in csv.DictReader(line.replace("\0", "") for line in fh):
++            if r.get("creator") and r.get("c_time"):
++                rows.append((db._cid(r["creator"]), _ts(r["c_time"]), _ts(r.get("g_time")), r.get("mint") or None))
++    before = db.conn.execute("select count(*) from launches").fetchone()[0]
++    db.conn.executemany("insert or ignore into launches(creator_id, ts, grad_ts, mint) values (?,?,?,?)", rows)
++    # у уже известных минтов мог появиться выход на AMM
++    db.conn.executemany("update launches set grad_ts=? where mint=? and grad_ts is null",
++                        [(g, m) for _, _, g, m in rows if g and m])
++    db.commit()
++    added = db.conn.execute("select count(*) from launches").fetchone()[0] - before
++    print(f"в выгрузке {len(rows):,}, добавлено {added:,} запусков")
++
++
+ if __name__ == "__main__":
+     if sys.platform == "win32":
+         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+     if "--seed" in sys.argv:
+         seed()
++    elif "--append" in sys.argv:
++        append(sys.argv[sys.argv.index("--append") + 1])
+     else:
+         print(__doc__)
+diff --git a/live/pump_events.py b/live/pump_events.py
+index 5976f65..2bd2aff 100755
+--- a/live/pump_events.py
++++ b/live/pump_events.py
+@@ -177,3 +177,25 @@ def events_from_logs(logs):
+             if stack and stack[-1] == parts[1]:
+                 stack.pop()
+     return out
++
++
++def events_from_tx(tx):
++    """
++    getTransaction (encoding=jsonParsed) -> [(event, outer_program)].
++
++    Запасной путь для транзакций с обрезанными логами ("Log truncated"):
++    те же события лежат в inner instructions (emit_cpi) и не обрезаются.
++    outer_program — программа инструкции верхнего уровня, как в events_from_logs.
++    """
++    if not tx or (tx.get("meta") or {}).get("err") is not None:
++        return []
++    top = [ix.get("programId") for ix in tx["transaction"]["message"]["instructions"]]
++    out = []
++    for grp in tx["meta"].get("innerInstructions") or ():
++        outer = top[grp["index"]] if grp["index"] < len(top) else None
++        for ix in grp.get("instructions") or ():
++            if ix.get("programId") == PUMP_PROGRAM and "data" in ix:
++                ev = decode_ix_data(ix["data"])
++                if ev:
++                    out.append((ev, outer))
++    return out
+diff --git a/live/state.py b/live/state.py
+index a1b9037..67c4edc 100755
+--- a/live/state.py
++++ b/live/state.py
+@@ -36,7 +36,7 @@ SUPPLY = 1e9
+ class Launch:
+     __slots__ = ("mint", "creator", "symbol", "name", "slot", "ts", "mayhem", "seen_at",
+                  "trades", "scored", "stage2_done", "wallets", "last_ts", "grad_ts", "peak_mc",
+-                 "n_tr", "features", "score")
++                 "n_tr", "features", "score", "gap")
+ 
+     def __init__(self, ev, slot, seen_at):
+         self.mint = ev["mint"]
+@@ -58,6 +58,7 @@ class Launch:
+         self.n_tr = 0
+         self.features = None
+         self.score = None
++        self.gap = False            # запуск пересёк обрыв WebSocket — сделки неполные
+ 
+     def add_trade(self, ev, slot, sig, outer):
+         rs = slot - self.slot
+@@ -68,7 +69,8 @@ class Launch:
+         if rt <= 300:
+             self.trades.append((rs, rt, sig, user, is_buy, sol, tok, outer))
+         w = self.wallets.get(user)
+-        if w is None:
++        new = w is None
++        if new:
+             w = self.wallets[user] = [rs, rt, 0.0, 0.0]
+         if is_buy:
+             w[2] += sol
+@@ -79,6 +81,7 @@ class Launch:
+         vs, vt = ev["virtual_sol_reserves"], ev["virtual_token_reserves"]
+         if vt:
+             self.peak_mc = max(self.peak_mc, vs / vt * 1e6)  # капитализация в SOL, как mc в census
++        return new                  # новый кошелёк в этом запуске — для счётчика ботов
+ 
+     # ---------- признаки ----------
+     def features_10s(self, devdb, comp_before):
+@@ -140,14 +143,16 @@ class Launch:
+             "n_progs": len(progs),
+         }
+ 
+-    def outcome(self):
+-        """Как census: «поздняя розница» = не дев, первая сделка после 5-го слота."""
++    def outcome(self, is_bot=None):
++        """Как census: «поздняя розница» = не дев, не бот, первая сделка после 5-го слота."""
+         rest_n = rest_spent = rest_net = l5_spent = l5_net = dev_net = 0.0
+         for u, (frs, frt, spent, recv) in self.wallets.items():
+             net = recv - spent
+             if u == self.creator:
+                 dev_net += net
+                 continue
++            if is_bot and is_bot(u):
++                continue
+             if frs > 5:
+                 rest_n += 1; rest_spent += spent; rest_net += net
+             if frt > 300:
+diff --git a/live_scorer.py b/live_scorer.py
+index f564d27..fb3897d 100755
+--- a/live_scorer.py
++++ b/live_scorer.py
+@@ -29,9 +29,12 @@ import argparse
+ import asyncio
+ import json
+ import os
++import queue
+ import sqlite3
+ import sys
++import threading
+ import time
++from collections import deque
+ from pathlib import Path
+ 
+ if sys.platform == "win32":
+@@ -48,7 +51,7 @@ except ImportError:
+ 
+ from live.devdb import DevDB
+ from live.model import Model
+-from live.pump_events import PUMP_PROGRAM, SOL_QUOTE, events_from_logs
++from live.pump_events import PUMP_PROGRAM, SOL_QUOTE, events_from_logs, events_from_tx
+ from live.state import Launch, TickerWindow
+ 
+ DECIDE_AFTER = float(os.environ.get("DECIDE_AFTER", 12))     # с после создания: 10 с окна + запас на confirmed
+@@ -58,6 +61,7 @@ EVICT_AGE = 86400
+ PENDING_TTL = 15             # сделки по минту, чьё создание ещё не пришло
+ MIN_WALLETS_ALERT = int(os.environ.get("MIN_WALLETS_ALERT", 3))
+ LIVE_DB = ROOT / "live.db"
++DEV_DB = ROOT / "devdb.sqlite"
+ 
+ SCHEMA = """
+ CREATE TABLE IF NOT EXISTS scores (
+@@ -99,38 +103,85 @@ def ws_url():
+     return f"wss://mainnet.helius-rpc.com/?api-key={key}"
+ 
+ 
++def rpc_url():
++    u = os.environ.get("RPC_URL")
++    if u:
++        return u
++    key = os.environ.get("HELIUS_API_KEY")
++    return f"https://mainnet.helius-rpc.com/?api-key={key}" if key else None
++
++
++def get_tx(url, sig):
++    """getTransaction с парой повторов: confirmed-транзакция появляется в RPC не мгновенно."""
++    import requests
++    body = {"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
++            "params": [sig, {"encoding": "jsonParsed", "commitment": "confirmed",
++                             "maxSupportedTransactionVersion": 0}]}
++    for delay in (0, 0.5, 1.5):
++        time.sleep(delay)
++        try:
++            res = requests.post(url, json=body, timeout=10).json().get("result")
++        except Exception:
++            res = None
++        if res:
++            return res
++    return None
++
++
+ class Telegram:
++    """Отправка в фоновом потоке: сеть не должна тормозить приём WebSocket."""
++
+     def __init__(self):
+         self.token = os.environ.get("TG_BOT_TOKEN")
+         self.chat = os.environ.get("TG_CHAT_ID")
+         self.on = bool(self.token and self.chat)
++        self.q = queue.Queue(maxsize=200)
++        if self.on:
++            threading.Thread(target=self._loop, daemon=True).start()
+ 
+     def send(self, text):
+         if not self.on:
+             return
+-        import requests
+         try:
+-            requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
+-                          json={"chat_id": self.chat, "text": text, "disable_web_page_preview": True},
+-                          timeout=10)
+-        except Exception as e:
+-            print(f"    [TG] не отправилось: {e}")
++            self.q.put_nowait(text)
++        except queue.Full:
++            print("    [TG] очередь переполнена, алерт пропущен")
++
++    def _loop(self):
++        import requests
++        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
++        while True:
++            text = self.q.get()
++            for _ in range(3):
++                try:
++                    r = requests.post(url, json={"chat_id": self.chat, "text": text,
++                                                 "disable_web_page_preview": True}, timeout=10)
++                    if r.status_code == 429:           # лимит Telegram: ждём, сколько сказали
++                        time.sleep(r.json().get("parameters", {}).get("retry_after", 5))
++                        continue
++                    break
++                except Exception as e:
++                    print(f"    [TG] не отправилось: {str(e).split('/bot')[0]}")
++                    time.sleep(2)
+ 
+ 
+ class Scorer:
+-    def __init__(self, replay=False):
++    def __init__(self, replay=False, live_db=LIVE_DB, dev_db=DEV_DB):
+         self.replay = replay
+         self.model = Model(ROOT / "model" / "live_model.json")
+-        self.devdb = DevDB()
++        self.devdb = DevDB(dev_db)
+         if not self.devdb.conn.execute("select 1 from launches limit 1").fetchone():
+             print("[!] история девов пуста — запусти: python -m live.devdb --seed")
+-        self.db = sqlite3.connect(LIVE_DB, timeout=30)
++        self.db = sqlite3.connect(live_db, timeout=30)
+         self.db.execute("pragma journal_mode=wal")
+         self.db.executescript(SCHEMA)
+         self.tickers = TickerWindow()
++        self.wal_launches = {}       # кошелёк -> в скольких запусках торговал (для отсева ботов)
+         self.launches = {}
+         self.comp = {}
+         self.pending = {}            # mint -> [(t, ev, slot, sig, outer)]
++        self.refetch = deque()       # (sig, slot) транзакций с обрезанными логами
++        self.can_refetch = not replay and bool(rpc_url())
+         self.tg = Telegram()
+         self.clock = 0.0             # в режиме replay — время последнего события
+         self.started = time.time()
+@@ -162,7 +213,16 @@ class Scorer:
+             self.st["failed_tx"] += 1
+             return
+         sig = val["signature"]
+-        for ev, outer in events_from_logs(val.get("logs")):
++        logs = val.get("logs") or []
++        if "Log truncated" in logs and self.can_refetch:     # строка бывает и не последней
++            # хвост лога обрезан: события в нём неполные. Берём всю транзакцию через RPC
++            self.st["truncated"] = self.st.get("truncated", 0) + 1
++            self.refetch.append((sig, slot))
++            return
++        self.dispatch(events_from_logs(logs), slot, sig)
++
++    def dispatch(self, events, slot, sig):
++        for ev, outer in events:
+             if self.replay:
+                 self.clock = max(self.clock, float(ev["timestamp"]))
+             k = ev["kind"]
+@@ -174,32 +234,42 @@ class Scorer:
+                 self.on_complete(ev)
+ 
+     def on_create(self, ev, slot):
+-        if ev.get("quote_mint", SOL_QUOTE) != SOL_QUOTE:
+-            self.st["creates_other_quote"] += 1       # модель училась только на котировке в SOL
+-            return
+         mint = ev["mint"]
+         if mint in self.launches:
+             return
++        # история дева и соседи по тикеру в census.sql считаются по ВСЕМ котировкам (cr_all) —
++        # поэтому пишем их до фильтра. История считается строго раньше ts, добавлять можно сразу
++        self.devdb.add_launch(ev["creator"], mint, ev["timestamp"])
++        comp = self.tickers.add_and_count(ev["symbol"], ev["creator"], ev["timestamp"])
++        if ev.get("quote_mint", SOL_QUOTE) != SOL_QUOTE:
++            self.st["creates_other_quote"] += 1       # модель училась только на котировке в SOL
++            return
+         self.st["creates"] += 1
+         L = Launch(ev, slot, self.now())
+         self.launches[mint] = L
+-        self.comp[mint] = self.tickers.add_and_count(ev["symbol"], ev["creator"], ev["timestamp"])
+-        # история дева считается по запускам строго раньше ts, поэтому добавлять можно сразу
+-        self.devdb.add_launch(ev["creator"], mint, ev["timestamp"])
++        self.comp[mint] = comp
+         for _, tev, tslot, tsig, touter in self.pending.pop(mint, ()):
+-            L.add_trade(tev, tslot, tsig, touter)
++            self._add(L, tev, tslot, tsig, touter)
+ 
+     def on_trade(self, ev, slot, sig, outer):
+         self.st["trades"] += 1
+         L = self.launches.get(ev["mint"])
+         if L is not None:
+-            L.add_trade(ev, slot, sig, outer)
++            self._add(L, ev, slot, sig, outer)
+             return
+         self.st["trades_unknown"] += 1
+         lst = self.pending.get(ev["mint"])
+         if lst is not None or len(self.pending) < 50_000:
+             self.pending.setdefault(ev["mint"], []).append((self.now(), ev, slot, sig, outer))
+ 
++    def _add(self, L, ev, slot, sig, outer):
++        if L.add_trade(ev, slot, sig, outer):
++            self.wal_launches[ev["user"]] = self.wal_launches.get(ev["user"], 0) + 1
++
++    def is_bot(self, u):
++        """Как bots в census.sql: торгует в >= 1% запусков (агент Mayhem, объёмные боты)."""
++        return self.wal_launches.get(u, 0) >= max(30, 0.01 * self.st["creates"])
++
+     def on_complete(self, ev):
+         self.st["completes"] += 1
+         self.devdb.mark_graduated(ev["mint"], ev["timestamp"])
+@@ -207,6 +277,14 @@ class Scorer:
+         if L is not None:
+             L.grad_ts = ev["timestamp"]
+ 
++    def mark_gap(self):
++        """Обрыв WebSocket: у запусков в памяти потеряны сделки — не алертим по ним."""
++        now = self.now()
++        for L in self.launches.values():
++            if now - L.seen_at < STAGE2_AFTER:   # окна 10 с и 5 мин задеты обрывом
++                L.gap = True
++        self.pending.clear()
++
+     # ---------- таймеры ----------
+     def tick(self):
+         now = self.now()
+@@ -231,6 +309,8 @@ class Scorer:
+         reasons = [(k, v, r) for k, v, r in self.model.reasons(f)]
+         txt = "; ".join(f"{REASON_TEXT[k](v)} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
+         L.scored, L.score = True, p
++        if L.gap:
++            lvl = "gap"                # окно 10 с пересекло обрыв: признаки неполные
+         lag = self.now() - L.seen_at
+         self.db.execute("insert or replace into scores values (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (L.mint, L.creator, L.symbol, L.name, L.ts, L.slot, p, lvl, txt,
+@@ -251,7 +331,7 @@ class Scorer:
+     def stage2(self, L):
+         s = L.features_5m()
+         flag = None
+-        if s["org_buyers_5m"] >= 5 and (s["direct_share"] or 0) >= 0.99:
++        if s["org_buyers_5m"] >= 5 and (s["direct_share"] or 0) >= 0.99 and not L.gap:
+             flag = "all_direct"        # все ранние мимо терминалов: сайт pump.fun или свои скрипты
+         L.stage2_done = True
+         L.trades = []                  # первые 5 минут больше не нужны
+@@ -264,19 +344,21 @@ class Scorer:
+                   f"покупателей зашли прямым вызовом pump | {L.mint}")
+ 
+     def close(self, L, why):
+-        o = L.outcome()
++        o = L.outcome(self.is_bot)
+         self.db.execute("insert or replace into outcomes values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (L.mint, int(o["graduated"]), o["t_grad"], o["last_ts"], o["n_tr"], o["n_wal"],
+                          o["peak_mc"], o["rest_n"], o["rest_spent"], o["rest_net"], o["l5_spent"],
+-                         o["l5_net"], o["dev_net"], why, int(self.now())))
++                         o["l5_net"], o["dev_net"], "gap" if L.gap else why, int(self.now())))
+         del self.launches[L.mint]
+         self.comp.pop(L.mint, None)
+         self.st["closed"] += 1
+ 
+-    def flush_all(self):
++    def flush_all(self, close=False):
+         for L in list(self.launches.values()):
+             if not L.scored and self.now() - L.seen_at >= DECIDE_AFTER:
+                 self.score(L)
++            if close and L.scored:
++                self.close(L, "shutdown")      # иначе в разметку попадают только умершие за сессию
+         self.db.commit()
+         self.devdb.commit()
+ 
+@@ -291,9 +373,27 @@ class Scorer:
+                   "(только внутренние инструкции) — пришли мне пару строк из --record")
+ 
+ 
++async def refetch_worker(sc):
++    url = rpc_url()
++    while True:
++        if not sc.refetch:
++            await asyncio.sleep(0.2)
++            continue
++        sig, slot = sc.refetch.popleft()
++        tx = await asyncio.to_thread(get_tx, url, sig)
++        if tx is None:
++            sc.st["refetch_failed"] = sc.st.get("refetch_failed", 0) + 1
++            continue
++        try:
++            sc.dispatch(events_from_tx(tx), slot, sig)
++        except Exception as e:
++            print(f"[ERR] refetch {sig[:12]}: {type(e).__name__}: {e}")
++
++
+ async def run_live(sc, record, record_max):
+     import websockets
+     url = ws_url()
++    worker = asyncio.create_task(refetch_worker(sc)) if sc.can_refetch else None  # noqa: F841 держим ссылку
+     sub = {"jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+            "params": [{"mentions": [PUMP_PROGRAM]}, {"commitment": "confirmed"}]}
+     rec = open(record, "a", encoding="utf-8") if record else None
+@@ -314,12 +414,21 @@ async def run_live(sc, record, record_max):
+                             if written >= record_max:      # поток pump — десятки ГБ в сутки
+                                 rec.close(); rec = None
+                                 print(f"[..] записал {written:,} сообщений в {record}, запись остановлена")
+-                        sc.on_message(raw)
++                        try:
++                            sc.on_message(raw)
++                        except Exception as e:           # одно битое сообщение не должно рвать поток
++                            sc.st["errors"] = sc.st.get("errors", 0) + 1
++                            if sc.st["errors"] <= 20:
++                                print(f"[ERR] сообщение пропущено: {type(e).__name__}: {e}")
+                     except asyncio.TimeoutError:
+                         pass
+                     t = time.time()
+                     if t - last_tick >= 1:
+-                        sc.tick(); last_tick = t
++                        try:
++                            sc.tick()
++                        except Exception as e:
++                            print(f"[ERR] tick: {type(e).__name__}: {e}")
++                        last_tick = t
+                     if t - last_rep >= 60:
+                         sc.report(); last_rep = t
+         except (KeyboardInterrupt, asyncio.CancelledError):
+@@ -327,6 +436,7 @@ async def run_live(sc, record, record_max):
+         except Exception as e:
+             msg = str(e).split("api-key=")[0]
+             print(f"[WS] {type(e).__name__}: {msg} — переподключаюсь через 5 с")
++            sc.mark_gap()
+             await asyncio.sleep(5)
+ 
+ 
+@@ -352,7 +462,17 @@ def main():
+     ap.add_argument("--record-max", type=int, default=20000, help="сколько сообщений записать")
+     ap.add_argument("--replay", help="прогнать записанный файл без сети")
+     a = ap.parse_args()
+-    sc = Scorer(replay=bool(a.replay))
++    if a.replay:
++        # replay не трогает боевые базы: история девов — снимком, оценки — в replay/live.db
++        rdir = ROOT / "replay"
++        rdir.mkdir(exist_ok=True)
++        for suf in ("", "-wal", "-shm"):
++            (rdir / f"live.db{suf}").unlink(missing_ok=True)
++        src, dst = sqlite3.connect(DEV_DB), sqlite3.connect(rdir / "devdb.sqlite")
++        src.backup(dst); dst.close(); src.close()
++        sc = Scorer(replay=True, live_db=rdir / "live.db", dev_db=rdir / "devdb.sqlite")
++    else:
++        sc = Scorer()
+     m = sc.model.meta
+     print("=" * 72)
+     print("  ClusterPulse — живой скорер")
+@@ -367,7 +487,7 @@ def main():
+         else:
+             asyncio.run(run_live(sc, a.record, a.record_max))
+     except KeyboardInterrupt:
+-        sc.flush_all()
++        sc.flush_all(close=not a.replay)
+         print("\n[STOP] остановлено, всё записано в live.db")
+ 
+ 
+diff --git a/requirements.txt b/requirements.txt
+index 01436d6..0b9d915 100755
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -3,3 +3,7 @@ gspread==6.1.2
+ google-auth==2.29.0
+ websockets>=12.0
+ python-dotenv>=1.0.0
++# retro/ (обучение и ретро-анализ)
++pandas
++numpy
++scikit-learn
+diff --git a/retro/census.sql b/retro/census.sql
+index 86a24d5..2e2334d 100755
+--- a/retro/census.sql
++++ b/retro/census.sql
+@@ -36,13 +36,19 @@ tr as (
+   join cr on cr.mint = t.mint
+   where t.evt_block_time >= timestamp '{D0}' and t.evt_block_time < timestamp '{D3}'
+ ),
++bots as (
++  -- инфраструктура, а не розница: агент Mayhem, объёмные и снайперские боты.
++  -- Кошелёк, торговавший в 300+ запусках дня (~1% всех), в метку не идёт
++  select u from tr group by u having count(distinct mint) >= 300
++),
+ w as (
+-  select mint, u, bool_or(is_cr) as is_cr,
++  select tr.mint, tr.u, bool_or(is_cr) as is_cr, bool_or(b.u is not null) as is_bot,
+          sum(case when is_buy then -sol else sol end) as net_sol,
+          sum(case when is_buy then sol else 0 end) as spent,
+          min(rs) as first_rs,
+-         bool_or(signer <> u) as copaid
+-  from tr group by 1, 2
++         bool_or(signer <> tr.u) as copaid
++  from tr left join bots b on b.u = tr.u
++  group by 1, 2
+ ),
+ agg as (
+   select mint,
+@@ -75,10 +81,10 @@ g as (
+     sum(case when is_cr then net_sol end) as dev_net,
+     sum(case when not is_cr and first_rs = 0 then net_sol end) as s0_net,
+     sum(case when not is_cr and first_rs between 1 and 5 then net_sol end) as early_net,
+-    sum(case when not is_cr and first_rs > 5 then net_sol end) as rest_net,
+-    sum(case when not is_cr and first_rs > 5 then spent end) as rest_spent,
+-    count(case when not is_cr and first_rs > 5 then 1 end) as rest_n,
+-    count(case when not is_cr and first_rs > 5 and net_sol > 0 then 1 end) as rest_winners,
++    sum(case when not is_cr and not is_bot and first_rs > 5 then net_sol end) as rest_net,
++    sum(case when not is_cr and not is_bot and first_rs > 5 then spent end) as rest_spent,
++    count(case when not is_cr and not is_bot and first_rs > 5 then 1 end) as rest_n,
++    count(case when not is_cr and not is_bot and first_rs > 5 and net_sol > 0 then 1 end) as rest_winners,
+     sum(case when net_sol > 0 then net_sol else 0 end) as total_profit,
+     sum(case when copaid and not is_cr then net_sol end) as copaid_net
+   from w group by 1
+diff --git a/retro/devgap.sql b/retro/devgap.sql
+new file mode 100644
+index 0000000..34200fe
+--- /dev/null
++++ b/retro/devgap.sql
+@@ -0,0 +1,14 @@
++-- Дыра в истории девов между концом переписи и стартом скорера.
++-- Даты поправь под себя: от конца последнего census_* до «сейчас».
++--   python retro/dq.py @retro/devgap.sql devgap
++--   python -m live.devdb --append dune_out/devgap.csv
++select c.mint, coalesce(c.creator, c."user") as creator, c.evt_block_time as c_time, g.g_time
++from pumpdotfun_solana.pump_evt_createevent c
++left join (
++  select mint, min(evt_block_time) as g_time
++  from pumpdotfun_solana.pump_evt_completeevent
++  where evt_block_time >= timestamp '2026-09-19 00:00:00'
++  group by 1
++) g on g.mint = c.mint
++where c.evt_block_time >= timestamp '2026-09-19 00:00:00'
++  and c.evt_block_time <  timestamp '2026-09-28 00:00:00'
+diff --git a/retro/train_live.py b/retro/train_live.py
+index 67619ce..a12ecb4 100755
+--- a/retro/train_live.py
++++ b/retro/train_live.py
+@@ -95,7 +95,9 @@ def main():
+     print(f"запусков с внешней розницей: {len(d):,}  ({d.c_time.min():%d.%m}–{d.c_time.max():%d.%m})")
+     print(f"доля ловушек: {d.trap.mean():.3f}")
+ 
+-    tr, te = d[d.week < 3], d[d.week == 3]
++    te = d[d.week == 3]
++    # зазор 3 дня: метка считается по сделкам до +3 дней, иначе хвост обучения видит проверочную неделю
++    tr = d[d.c_time < te.c_time.min() - pd.Timedelta(days=3)]
+     m = fit(tr[FEATURES], tr.trap)
+     p = m.predict_proba(te[FEATURES])[:, 1]
+     y = te.trap.values
+@@ -111,6 +113,10 @@ def main():
+           f"жёлтого (топ-10%): {q['p90']:.3f} -> {prec['p90']:.3f}")
+ 
+     final = fit(d[FEATURES], d.trap)
++    # пороги — квантили ТОЙ модели, что уходит в бой: у m и final разная шкала вероятностей,
++    # и пороги m на final давали красный у 3,4% запусков вместо 2%
++    pf = final.predict_proba(te[FEATURES])[:, 1]
++    q_final = {k: float(np.quantile(pf, v)) for k, v in [("p90", .90), ("p98", .98)]}
+     # объяснения: доля ловушек по корзинам каждого признака (плюс корзина «нет значения»)
+     expl = {}
+     for c, edges in BINS.items():
+@@ -132,7 +138,7 @@ def main():
+     meta = {"target": "розница на не вышедшем токене теряет >50%", "base_rate": float(d.trap.mean()),
+             "holdout": {"auc": float(auc), "top10": float(y[top10].mean()), "top2": float(y[top2].mean()),
+                         "base": float(y.mean()), "n": int(len(y))},
+-            "thresholds": q, "precision_at": prec, "explain": expl, "roi_by_level": roi,
++            "thresholds": q_final, "thresholds_holdout_model": q, "precision_at": prec, "explain": expl, "roi_by_level": roi,
+             "min_retail_sol": MIN_RETAIL_SOL,
+             "trained_on": f"{d.c_time.min():%Y-%m-%d}..{d.c_time.max():%Y-%m-%d}", "n_train": int(len(d))}
+     path = MODEL_DIR / "live_model.json"
+diff --git a/tests/test_live.py b/tests/test_live.py
+index a0d2d70..85b8fa8 100755
+--- a/tests/test_live.py
++++ b/tests/test_live.py
+@@ -93,8 +93,11 @@ def init(self):
+     self.devdb.mark_graduated("old1", T0 - 80000)
+     self.devdb.add_launch(m(DEV), "ancient", T0 - 40 * 86400)
+     self.db = sqlite3.connect(tmp / "live.db"); self.db.executescript(live_scorer.SCHEMA)
++    self.wal_launches = {}
+     self.tickers = live_scorer.TickerWindow(); self.tickers.add_and_count("test", m(pk(90)), T0 - 60)
+     self.launches, self.comp, self.pending = {}, {}, {}
++    from collections import deque
++    self.refetch, self.can_refetch = deque(), False
+     self.tg = live_scorer.Telegram(); self.tg.on = False
+     self.clock, self.started = 0.0, 0
+     self.st = dict(msgs=0, failed_tx=0, creates=0, creates_other_quote=0, trades=0, trades_unknown=0,
+@@ -120,4 +123,28 @@ assert o["graduated"] and o["t_grad"] == 420
+ assert abs(o["rest_spent"] - 3.0) < 1e-9 and abs(o["rest_net"] + 3.0) < 1e-9, o   # E: первая сделка в слоте 40 (>5)
+ assert abs(o["dev_net"] - 3.0) < 1e-9, o
+ print("исходы: ок", {k: o[k] for k in ("rest_n", "rest_spent", "rest_net", "dev_net", "graduated")})
++
++# --- 4. обрезанный лог: уходит в очередь, события берутся из getTransaction
++from live.pump_events import events_from_tx
++M2 = pk(11)
++tx = {"meta": {"err": None, "innerInstructions": [{"index": 1, "instructions": [
++        {"programId": PUMP_PROGRAM, "data": b58encode(bytes([102]) * 8)},                  # сама инструкция buy
++        {"programId": PUMP_PROGRAM, "data": b58encode(EVENT_IX_TAG + create(M2, DEV, "TRNC", T0 + 500))},
++        {"programId": PUMP_PROGRAM, "data": b58encode(EVENT_IX_TAG + trade(M2, A, True, 10**9, 3 * 10**13, T0 + 500, DEV))}]}]},
++      "transaction": {"message": {"instructions": [{"programId": "ComputeBudget111111111111111111111111111111"},
++                                                   {"programId": ROUTER}]}}}
++ev = events_from_tx(tx)
++assert [e["kind"] for e, _ in ev] == ["create", "trade"] and all(o == ROUTER for _, o in ev), ev
++sc.can_refetch = True
++sc.on_message(note(S0 + 2000, "sig_trunc", logs([create(M2, DEV, "TRNC", T0 + 500)])[:4] + ["Log truncated"]))
++assert list(sc.refetch) == [("sig_trunc", S0 + 2000)] and m(M2) not in sc.launches
++sc.dispatch(ev, S0 + 2000, "sig_trunc")
++assert sc.launches[m(M2)].trades[0][3] == m(A)
++print("обрезанные логи: ок")
++
++# --- 5. обрыв WebSocket: молодой запуск помечается, алерта нет
++sc.mark_gap()
++sc.clock += 20; sc.tick()
++assert sc.db.execute("select level from scores where mint=?", (m(M2),)).fetchone()[0] == "gap"
++print("обрыв: ок")
+ print("ВСЁ ОК")

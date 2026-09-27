@@ -19,3 +19,21 @@ Claude outputs/
 # --- internal planning, not for the repo ---
 PLAN-*.md
 ClusterPulse-RU.md
+
+# --- research dumps ---
+dune_out/
+
+# --- live scorer ---
+devdb.sqlite*
+live.db*
+raw*.jsonl
+launches.db
+ws_debug*
+
+# --- чужое и тяжёлое: не для репо ClusterPulse ---
+analysis/
+*.bak
+*.db
+*.db-shm
+*.db-wal
+replay/
