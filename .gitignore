@@ -37,3 +37,6 @@ analysis/
 *.db-shm
 *.db-wal
 replay/
+
+# --- логи скорера ---
+logs/

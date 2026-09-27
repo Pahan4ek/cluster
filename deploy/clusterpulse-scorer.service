@@ -1,0 +1,22 @@
+# VPS: sudo cp deploy/clusterpulse-scorer.service /etc/systemd/system/
+#      sudo systemctl daemon-reload && sudo systemctl enable --now clusterpulse-scorer
+#      journalctl -u clusterpulse-scorer -f
+[Unit]
+Description=ClusterPulse live scorer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clusterpulse
+WorkingDirectory=/opt/clusterpulse
+EnvironmentFile=/opt/clusterpulse/.env
+ExecStartPre=/bin/sh -c 'test -f devdb.sqlite || /opt/clusterpulse/.venv/bin/python -m live.devdb --seed'
+ExecStart=/opt/clusterpulse/.venv/bin/python -u live_scorer.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/clusterpulse/logs/scorer.log
+StandardError=append:/opt/clusterpulse/logs/scorer.log
+
+[Install]
+WantedBy=multi-user.target
