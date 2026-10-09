@@ -1,3 +1,5 @@
+<img src="docs/logo-256.png" width="120" align="right" alt="ClusterPulse logo">
+
 # ClusterPulse
 
 **A 10-second trap-risk score for every pump.fun launch, streamed live from Solana through Solami Mirage.**

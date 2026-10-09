@@ -43,3 +43,7 @@ logs/
 
 # --- артефакты FUSE-монтирования ---
 .fuse_hidden*
+
+# --- drafts of hackathon forms, tester feedback ---
+submission/
+feedback/
