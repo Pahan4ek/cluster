@@ -212,7 +212,7 @@ class Scorer:
         self.model = Model(MODEL_PATH)
         self.devdb = DevDB(dev_db)
         if not self.devdb.conn.execute("select 1 from launches limit 1").fetchone():
-            print("[!] история девов пуста — запусти: python -m live.devdb --seed")
+            print("[!] dev history is empty — run: python -m live.devdb --seed")
         self.db = sqlite3.connect(live_db, timeout=30)
         self.db.execute("pragma journal_mode=wal")
         self.db.executescript(SCHEMA)
@@ -368,7 +368,10 @@ class Scorer:
         p = self.model.predict(f)
         lvl = self.model.level(p)
         reasons = [(k, v, r) for k, v, r in self.model.reasons(f)]
-        txt = "; ".join(f"{REASON_TEXT[k](v)} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
+        if ALERT_LANG == "ru":
+            txt = "; ".join(f"{REASON_TEXT[k](v)} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
+        else:
+            txt = "; ".join(f"{REASON_TEXT_EN[k](v)} ({r:.0%} traps)" for k, v, r in reasons)
         L.scored, L.score = True, p
         if L.gap:
             lvl = "gap"                # окно 10 с пересекло обрыв: признаки неполные
@@ -383,7 +386,7 @@ class Scorer:
             self.st["red"] += 1
             active = (f["n_wal_10s"] or 0) >= MIN_WALLETS_ALERT
             line = (f"[{time.strftime('%H:%M:%S')}] 🔴 {L.symbol[:12]:12s} {p:.2f} "
-                    f"| {L.mint} | {txt or 'комбинация признаков'}")
+                    f"| {L.mint} | {txt or 'combination of signals'}")
             print(line)
             if active:
                 self.tg.send(self.alert_text(L, p, reasons))
@@ -412,8 +415,8 @@ class Scorer:
                          s["n_progs"], flag, int(self.now())))
         self.st["stage2"] += 1
         if flag:
-            print(f"[{time.strftime('%H:%M:%S')}] 🟠 {L.symbol[:12]:12s} все {s['org_buyers_5m']} ранних "
-                  f"покупателей зашли прямым вызовом pump | {L.mint}")
+            print(f"[{time.strftime('%H:%M:%S')}] 🟠 {L.symbol[:12]:12s} all {s['org_buyers_5m']} early "
+                  f"buyers called pump directly (no terminal) | {L.mint}")
 
     def close(self, L, why):
         o = L.outcome(self.is_bot)
@@ -437,9 +440,10 @@ class Scorer:
     def report(self):
         s = self.st
         up = (time.time() - self.started) / 60
-        print(f"[{time.strftime('%H:%M:%S')}] {up:5.1f} мин | сообщений {s['msgs']:,} | запусков {s['creates']:,} "
-              f"| сделок {s['trades']:,} | выходов на AMM {s['completes']} | оценено {s['scored']:,} "
-              f"(🔴 {s['red']}, 🟡 {s['yellow']}) | в памяти {len(self.launches):,}")
+        extra = "".join(f" | {k} {s[k]:,}" for k in ("truncated", "refetch_failed", "errors") if s.get(k))
+        print(f"[{time.strftime('%H:%M:%S')}] {up:5.1f} min | tx {s['msgs']:,} | launches {s['creates']:,} "
+              f"| trades {s['trades']:,} | graduated {s['completes']} | scored {s['scored']:,} "
+              f"(🔴 {s['red']}, 🟡 {s['yellow']}) | in memory {len(self.launches):,}{extra}")
         if s["msgs"] > 200 and s["creates"] == 0 and s["trades"] == 0:
             print("  [!] сообщения идут, но событий pump не разобрано. Скорее всего, событий нет в логах "
                   "(только внутренние инструкции) — пришли мне пару строк из --record")
@@ -475,7 +479,7 @@ async def run_live(sc, record, record_max):
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=16 * 2**20) as ws:
                 await ws.send(json.dumps(sub))
-                print(f"[..] подключился к {url.split('?')[0]} (logsSubscribe)")
+                print(f"[..] connected to {url.split('?')[0]} (logsSubscribe)")
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -506,12 +510,12 @@ async def run_live(sc, record, record_max):
         except (KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as e:
-            print(f"[WS] {type(e).__name__}: {_hide(str(e))} — переподключаюсь через 5 с")
+            print(f"[WS] {type(e).__name__}: {_hide(str(e))} — reconnecting in 5 s")
             sc.mark_gap()
             await asyncio.sleep(5)
 
 
-async def run_mirage(sc, sid, record, record_max):
+async def run_mirage(sc, sid, record, record_max, give_up=None):
     """Solami Mirage: бинарные кадры SubscribeUpdate по сохранённой подписке на программу pump."""
     import base64
     import websockets
@@ -519,12 +523,12 @@ async def run_mirage(sc, sid, record, record_max):
     rec = open(record, "a", encoding="utf-8") if record else None
     written = 0
     last_tick = last_rep = 0.0
-    backoff = 2
+    backoff, fails = 2, 0
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=64 * 2**20) as ws:
-                print(f"[..] подключился к Solami Mirage, подписка {sid[:8]}… (транзакции целиком, без добора)")
-                backoff = 2
+                print(f"[..] connected to Solami Mirage, subscription {sid[:8]}… (full transactions, no refetch)")
+                backoff, fails = 2, 0
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -559,10 +563,14 @@ async def run_mirage(sc, sid, record, record_max):
             raise
         except Exception as e:
             code = getattr(e, "code", None) or getattr(getattr(e, "rcvd", None), "code", None)
-            hint = {4029: "лимит одновременных стримов", 4002: "кончились трафик и баланс",
-                    1001: "Solami перезапускает узел"}.get(code, "")
-            print(f"[MIRAGE] {type(e).__name__}: {_hide(str(e))[:200]} {hint} — переподключаюсь через {backoff} с")
+            hint = {4029: "(concurrent stream limit)", 4002: "(bandwidth and balance exhausted)",
+                    1001: "(Solami node restart)"}.get(code, "")
+            print(f"[MIRAGE] {type(e).__name__}: {_hide(str(e))[:200]} {hint} — reconnecting in {backoff} s")
             sc.mark_gap()
+            fails += 1
+            if give_up and fails >= give_up:       # например, кончился пробный Pro у Solami
+                print(f"[MIRAGE] {fails} failed connects in a row — switching to logsSubscribe")
+                return
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -603,7 +611,7 @@ def main():
         except Exception as e:
             if a.source != "auto":
                 sys.exit(f"[FATAL] {_hide(str(e))}")
-            print(f"[!] {_hide(str(e))}\n[!] Mirage недоступен — работаю через logsSubscribe")
+            print(f"[!] {_hide(str(e))}\n[!] Mirage unavailable — using logsSubscribe")
             src_kind = "ws"
     if a.replay:
         # replay не трогает боевые базы: история девов — снимком, оценки — в replay/live.db
@@ -623,23 +631,28 @@ def main():
             sc.source = "Solami WS" if ("solami" in ws_url()) else "WebSocket"
     m = sc.model.meta
     print("=" * 72)
-    print("  ClusterPulse — живой скорер")
-    print(f"  модель: {m['trained_on']}, проверка на отложенной неделе AUC {m['holdout']['auc']:.3f}")
-    print(f"  🔴 от {sc.model.red:.2f} (точность на проверке {m['precision_at']['p98']:.0%}), "
-          f"🟡 от {sc.model.yellow:.2f} ({m['precision_at']['p90']:.0%}); база {m['holdout']['base']:.0%}")
-    print(f"  решение через {DECIDE_AFTER:.0f} с после создания | Telegram: {'вкл' if sc.tg.on else 'выкл'} "
-          f"({ALERT_LANG}) | источник: {sc.source}")
+    print("  ClusterPulse — live pump.fun launch risk scorer")
+    print(f"  model: census {m['trained_on']}, held-out week AUC {m['holdout']['auc']:.3f}")
+    print(f"  🔴 from {sc.model.red:.2f} (held-out trap rate {m['precision_at']['p98']:.0%}), "
+          f"🟡 from {sc.model.yellow:.2f} ({m['precision_at']['p90']:.0%}); base {m['holdout']['base']:.0%}")
+    print(f"  decision {DECIDE_AFTER:.0f} s after creation | Telegram: {'on' if sc.tg.on else 'off'} "
+          f"({ALERT_LANG}) | source: {sc.source}")
     print("=" * 72)
     try:
         if a.replay:
             run_replay(sc, a.replay)
         elif src_kind == "mirage":
-            asyncio.run(run_mirage(sc, sid, a.record, a.record_max))
+            asyncio.run(run_mirage(sc, sid, a.record, a.record_max, give_up=8 if a.source == "auto" else None))
+            if a.source == "auto":
+                if os.environ.get("HELIUS_API_KEY") and not os.environ.get("WS_URL"):
+                    os.environ["SOLAMI_API_KEY"] = ""      # Solami не отвечает: logsSubscribe через Helius
+                sc.source, sc.can_refetch = "WebSocket (fallback)", bool(rpc_url())
+                asyncio.run(run_live(sc, a.record, a.record_max))
         else:
             asyncio.run(run_live(sc, a.record, a.record_max))
     except KeyboardInterrupt:
         sc.flush_all(close=not a.replay)
-        print("\n[STOP] остановлено, всё записано в live.db")
+        print("\n[STOP] stopped, everything is saved in live.db")
 
 
 if __name__ == "__main__":
