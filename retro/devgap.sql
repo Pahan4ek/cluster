@@ -11,4 +11,4 @@ left join (
   group by 1
 ) g on g.mint = c.mint
 where c.evt_block_time >= timestamp '2026-09-19 00:00:00'
-  and c.evt_block_time <  timestamp '2026-09-28 00:00:00'
+  and c.evt_block_time <  timestamp '2026-10-12 00:00:00'

@@ -110,12 +110,70 @@ def run(sql, name=None, performance=None, timeout_s=1500, quiet=False):
     return rows
 
 
+def submit(sql, name, performance=None):
+    """Отправить запрос и выйти: для оболочек, где процесс живёт меньше, чем считает Dune.
+    Забрать результат: python retro/dq.py --collect <name> (можно звать много раз)."""
+    before, limit = _check()
+    r = requests.post(f"{API}/sql/execute", headers=H, json={"sql": sql, **({"performance": performance} if performance else {})}, timeout=60)
+    if r.status_code >= 400:
+        print("ERR submit", r.status_code, r.text[:500]); return None
+    eid = r.json()["execution_id"]
+    (OUT / f"_pending_{name}.json").write_text(json.dumps({"eid": eid, "before": before, "t0": time.time()}), encoding="utf-8")
+    print(f"-- отправлено: {eid} -> --collect {name}")
+    return eid
+
+
+def collect(name, wait_s=150):
+    pf = OUT / f"_pending_{name}.json"
+    p = json.loads(pf.read_text(encoding="utf-8"))
+    eid, t_end = p["eid"], time.time() + wait_s
+    while True:
+        st = requests.get(f"{API}/execution/{eid}/status", headers=H, timeout=60).json()
+        s = st.get("state")
+        if s == "QUERY_STATE_COMPLETED":
+            break
+        if s in ("QUERY_STATE_FAILED", "QUERY_STATE_CANCELLED", "QUERY_STATE_EXPIRED"):
+            print("ERR", s, json.dumps(st.get("error") or st, ensure_ascii=False)[:1500]); pf.replace(OUT / f"_done_{name}.json"); return None
+        if time.time() > t_end:
+            print(f"-- ещё считается ({s}), {time.time()-p['t0']:.0f} с с отправки"); return None
+        time.sleep(3)
+    md = st.get("result_metadata") or {}
+    _add_local(float(st.get("execution_cost_credits") or 0), int(md.get("datapoint_count") or 0))
+    print(f"-- выполнено: {st.get('execution_cost_credits', 0):.2f} кр, {md.get('total_row_count')} строк, "
+          f"{md.get('datapoint_count')} датапоинтов")
+    rows, cols, off = [], None, 0
+    while True:
+        res = requests.get(f"{API}/execution/{eid}/results", headers=H, params={"limit": 25000, "offset": off}, timeout=180).json()
+        rr = res.get("result") or {}
+        cols = cols or (rr.get("metadata") or {}).get("column_names")
+        rows += rr.get("rows") or []
+        nx = res.get("next_offset")
+        if nx is None or nx == off:
+            break
+        off = nx
+    after, limit, used, incl = spent_report()
+    with open(OUT / "_spend.log", "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{name}\t{len(rows)}\t{after-p['before']:.1f}\t{after:.1f}\n")
+    cols = cols or (list(rows[0]) if rows else [])
+    with open(OUT / f"{name}.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore"); w.writeheader(); w.writerows(rows)
+    pf.replace(OUT / f"_done_{name}.json")
+    print(f"-- {len(rows)} строк -> dune_out/{name}.csv | запрос {after-p['before']:.1f} кр | запуск {after:.0f}/{limit} | цикл {used:.0f}/{incl:.0f}")
+    return rows
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "--budget":
         print("запуск: {:.0f} из {} кр | цикл {:.0f}/{:.0f}".format(*spent_report())); sys.exit()
     if sys.argv[1] == "--budget-extend":
         b = _budget(); b["limit"] += BUDGET; BUDGET_FILE.write_text(json.dumps(b), encoding="utf-8")
         print(f"лимит запуска поднят до {b['limit']}"); sys.exit()
+    if sys.argv[1] == "--collect":
+        collect(sys.argv[2]); sys.exit()
+    if sys.argv[1] == "--submit":
+        q = sys.argv[2]
+        q = open(q[1:], encoding="utf-8").read() if q.startswith("@") else q
+        submit(q, sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else None); sys.exit()
     sql = sys.argv[1]
     if sql.startswith("@"):
         sql = open(sql[1:], encoding="utf-8").read()

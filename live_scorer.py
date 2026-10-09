@@ -23,7 +23,13 @@ model/live_model.json и пишем результат в live.db. Красны�
     python live_scorer.py --record raw.jsonl   # и писать сырые сообщения (первые 20k, см. --record-max)
     python live_scorer.py --replay raw.jsonl   # прогнать записанное, без сети
 
-WebSocket: по умолчанию Helius из HELIUS_API_KEY; свой — через WS_URL в .env.
+Источник данных (--source, по умолчанию auto):
+    mirage — Solami Mirage: Yellowstone geyser поверх WebSocket, транзакции целиком,
+             события pump из внутренних инструкций, без добора getTransaction.
+             Нужен SOLAMI_API_KEY (MirageStream + MirageManage) или SOLAMI_MIRAGE_ID.
+    ws     — logsSubscribe: WS_URL из .env, иначе Solami (SOLAMI_API_KEY), иначе Helius.
+    auto   — mirage, если есть SOLAMI_API_KEY, иначе ws.
+    python live_scorer.py --source mirage --record raw_mirage.jsonl   # писать кадры Mirage (base64)
 """
 import argparse
 import asyncio
@@ -49,6 +55,7 @@ try:
 except ImportError:
     pass
 
+from live import mirage
 from live.devdb import DevDB
 from live.model import Model
 from live.pump_events import PUMP_PROGRAM, SOL_QUOTE, events_from_logs, events_from_tx
@@ -61,6 +68,8 @@ EVICT_AGE = 86400
 PENDING_TTL = 15             # сделки по минту, чьё создание ещё не пришло
 MIN_WALLETS_ALERT = int(os.environ.get("MIN_WALLETS_ALERT", 3))
 LIVE_DB = ROOT / "live.db"
+MODEL_PATH = ROOT / os.environ.get("MODEL_PATH", "model/live_model.json")
+ALERT_LANG = os.environ.get("ALERT_LANG", "en")   # язык алертов в Telegram: en | ru
 DEV_DB = ROOT / "devdb.sqlite"
 
 SCHEMA = """
@@ -93,13 +102,43 @@ REASON_TEXT = {
 }
 
 
+REASON_TEXT_EN = {
+    "dev_supply": lambda v: f"dev bought {v:.0%} of supply in the first block",
+    "nondev_s0": lambda v: f"other wallets bought {v:.0%} of supply in the first block",
+    "s2_supply": lambda v: f"{v:.0%} of supply bought in the first 3 slots",
+    "s0_buyers": lambda v: f"{v:.0f} non-dev buyers in the first block",
+    "multi_tx": lambda v: f"{v:.0f} multi-wallet transactions at launch",
+    "max_wal_per_tx": lambda v: f"up to {v:.0f} wallets in one transaction",
+    "dev_prev_30d": lambda v: f"dev launched {v:.0f} tokens in 30 days",
+    "dev_prev_grad": lambda v: f"dev had {v:.0f} graduations in 30 days",
+    "dev_grad_rate": lambda v: f"dev graduation rate {v:.1%}",
+    "comp_before": lambda v: f"{v:.0f} launches with this ticker in 30 min",
+    "mayhem": lambda v: "mayhem mode",
+    "n_wal_10s": lambda v: f"{v:.0f} wallets in 10 s",
+    "net_supply_10s": lambda v: f"{v:.0%} net supply bought in 10 s",
+}
+
+
+def _hide(text):
+    """Ключи в URL не должны попадать в лог."""
+    for k in ("api-key=", "api_key="):
+        text = text.split(k)[0]
+    return text
+
+
+def solami_key():
+    return os.environ.get("SOLAMI_API_KEY") or None
+
+
 def ws_url():
     u = os.environ.get("WS_URL")
     if u:
         return u
+    if solami_key():
+        return mirage.WS.format(key=solami_key())
     key = os.environ.get("HELIUS_API_KEY")
     if not key:
-        sys.exit("[FATAL] нет ни WS_URL, ни HELIUS_API_KEY в .env")
+        sys.exit("[FATAL] нет ни WS_URL, ни SOLAMI_API_KEY, ни HELIUS_API_KEY в .env")
     return f"wss://mainnet.helius-rpc.com/?api-key={key}"
 
 
@@ -107,6 +146,8 @@ def rpc_url():
     u = os.environ.get("RPC_URL")
     if u:
         return u
+    if solami_key():
+        return mirage.RPC.format(key=solami_key())
     key = os.environ.get("HELIUS_API_KEY")
     return f"https://mainnet.helius-rpc.com/?api-key={key}" if key else None
 
@@ -168,7 +209,7 @@ class Telegram:
 class Scorer:
     def __init__(self, replay=False, live_db=LIVE_DB, dev_db=DEV_DB):
         self.replay = replay
-        self.model = Model(ROOT / "model" / "live_model.json")
+        self.model = Model(MODEL_PATH)
         self.devdb = DevDB(dev_db)
         if not self.devdb.conn.execute("select 1 from launches limit 1").fetchone():
             print("[!] история девов пуста — запусти: python -m live.devdb --seed")
@@ -185,6 +226,7 @@ class Scorer:
         self.tg = Telegram()
         self.clock = 0.0             # в режиме replay — время последнего события
         self.started = time.time()
+        self.source = "replay" if replay else "?"
         self.st = dict(msgs=0, failed_tx=0, creates=0, creates_other_quote=0, trades=0,
                        trades_unknown=0, completes=0, scored=0, red=0, yellow=0, stage2=0, closed=0)
 
@@ -192,7 +234,26 @@ class Scorer:
         return self.clock if self.replay else time.time()
 
     # ---------- входящие ----------
+    def on_frame(self, frame):
+        """Кадр Solami Mirage (bytes SubscribeUpdate): транзакция целиком, добор не нужен."""
+        u = mirage.parse(frame)
+        if u[0] != "tx":
+            return
+        _, slot, sig, failed, events = u
+        self.st["msgs"] += 1
+        if failed:
+            self.st["failed_tx"] += 1
+            return
+        self.dispatch(events, slot, sig)
+
     def on_message(self, raw):
+        if isinstance(raw, (bytes, bytearray)):
+            self.on_frame(raw)
+            return
+        if raw.startswith('{"m":'):              # записанный кадр Mirage (--record в режиме mirage)
+            import base64
+            self.on_frame(base64.b64decode(json.loads(raw)["m"]))
+            return
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
@@ -325,8 +386,19 @@ class Scorer:
                     f"| {L.mint} | {txt or 'комбинация признаков'}")
             print(line)
             if active:
-                self.tg.send(f"🔴 {L.symbol} — риск {p:.0%} (порог {self.model.red:.0%})\n{txt}\n"
-                             f"https://pump.fun/coin/{L.mint}")
+                self.tg.send(self.alert_text(L, p, reasons))
+
+    def alert_text(self, L, p, reasons):
+        base = self.model.meta["base_rate"]
+        if ALERT_LANG == "ru":
+            txt = "\n".join(f"├ {REASON_TEXT[k](v)} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
+            return (f"🔴 ${L.symbol} — риск {p:.0%} (база {base:.0%})\n{txt or '├ комбинация признаков'}\n"
+                    f"└ https://pump.fun/coin/{L.mint}")
+        txt = "\n".join(f"├ {REASON_TEXT_EN[k](v)} — {r:.0%} of such launches were traps" for k, v, r in reasons)
+        return (f"🔴 ${L.symbol} — trap risk {p:.0%} (market base {base:.0%})\n"
+                f"{txt or '├ combination of signals'}\n"
+                f"├ scored {self.now() - L.seen_at:.0f} s after creation · source: {self.source}\n"
+                f"└ https://pump.fun/coin/{L.mint}")
 
     def stage2(self, L):
         s = L.features_5m()
@@ -403,7 +475,7 @@ async def run_live(sc, record, record_max):
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=16 * 2**20) as ws:
                 await ws.send(json.dumps(sub))
-                print(f"[..] подключился к {url.split('?')[0]}")
+                print(f"[..] подключился к {url.split('?')[0]} (logsSubscribe)")
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -434,10 +506,65 @@ async def run_live(sc, record, record_max):
         except (KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as e:
-            msg = str(e).split("api-key=")[0]
-            print(f"[WS] {type(e).__name__}: {msg} — переподключаюсь через 5 с")
+            print(f"[WS] {type(e).__name__}: {_hide(str(e))} — переподключаюсь через 5 с")
             sc.mark_gap()
             await asyncio.sleep(5)
+
+
+async def run_mirage(sc, sid, record, record_max):
+    """Solami Mirage: бинарные кадры SubscribeUpdate по сохранённой подписке на программу pump."""
+    import base64
+    import websockets
+    url = mirage.stream_url(solami_key(), sid)
+    rec = open(record, "a", encoding="utf-8") if record else None
+    written = 0
+    last_tick = last_rep = 0.0
+    backoff = 2
+    while True:
+        try:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=64 * 2**20) as ws:
+                print(f"[..] подключился к Solami Mirage, подписка {sid[:8]}… (транзакции целиком, без добора)")
+                backoff = 2
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        if isinstance(raw, str):         # служебное текстовое сообщение
+                            print(f"[MIRAGE] {_hide(raw)[:300]}")
+                        else:
+                            if rec:
+                                rec.write(json.dumps({"m": base64.b64encode(raw).decode()}))
+                                rec.write("\n")
+                                written += 1
+                                if written >= record_max:
+                                    rec.close(); rec = None
+                                    print(f"[..] записал {written:,} кадров в {record}, запись остановлена")
+                            try:
+                                sc.on_frame(raw)
+                            except Exception as e:
+                                sc.st["errors"] = sc.st.get("errors", 0) + 1
+                                if sc.st["errors"] <= 20:
+                                    print(f"[ERR] кадр пропущен: {type(e).__name__}: {e}")
+                    except asyncio.TimeoutError:
+                        pass
+                    t = time.time()
+                    if t - last_tick >= 1:
+                        try:
+                            sc.tick()
+                        except Exception as e:
+                            print(f"[ERR] tick: {type(e).__name__}: {e}")
+                        last_tick = t
+                    if t - last_rep >= 60:
+                        sc.report(); last_rep = t
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            code = getattr(e, "code", None) or getattr(getattr(e, "rcvd", None), "code", None)
+            hint = {4029: "лимит одновременных стримов", 4002: "кончились трафик и баланс",
+                    1001: "Solami перезапускает узел"}.get(code, "")
+            print(f"[MIRAGE] {type(e).__name__}: {_hide(str(e))[:200]} {hint} — переподключаюсь через {backoff} с")
+            sc.mark_gap()
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
 def run_replay(sc, path):
@@ -461,10 +588,26 @@ def main():
     ap.add_argument("--record", help="дописывать сырые сообщения WebSocket в файл")
     ap.add_argument("--record-max", type=int, default=20000, help="сколько сообщений записать")
     ap.add_argument("--replay", help="прогнать записанный файл без сети")
+    ap.add_argument("--source", choices=["auto", "mirage", "ws"], default=os.environ.get("SOURCE", "auto"),
+                    help="mirage — Solami Mirage; ws — logsSubscribe; auto — mirage при SOLAMI_API_KEY")
     a = ap.parse_args()
+    src_kind = a.source
+    if src_kind == "auto":
+        src_kind = "mirage" if solami_key() else "ws"
+    if src_kind == "mirage" and not solami_key():
+        sys.exit("[FATAL] --source mirage: нет SOLAMI_API_KEY в .env")
+    sid = None
+    if src_kind == "mirage" and not a.replay:
+        try:
+            sid = mirage.ensure_subscription(solami_key())
+        except Exception as e:
+            if a.source != "auto":
+                sys.exit(f"[FATAL] {_hide(str(e))}")
+            print(f"[!] {_hide(str(e))}\n[!] Mirage недоступен — работаю через logsSubscribe")
+            src_kind = "ws"
     if a.replay:
         # replay не трогает боевые базы: история девов — снимком, оценки — в replay/live.db
-        rdir = ROOT / "replay"
+        rdir = Path(os.environ.get("REPLAY_DIR", ROOT / "replay"))
         rdir.mkdir(exist_ok=True)
         for suf in ("", "-wal", "-shm"):
             (rdir / f"live.db{suf}").unlink(missing_ok=True)
@@ -473,17 +616,25 @@ def main():
         sc = Scorer(replay=True, live_db=rdir / "live.db", dev_db=rdir / "devdb.sqlite")
     else:
         sc = Scorer()
+        if src_kind == "mirage":
+            sc.source = "Solami Mirage"
+            sc.can_refetch = False         # транзакции приходят целиком
+        else:
+            sc.source = "Solami WS" if ("solami" in ws_url()) else "WebSocket"
     m = sc.model.meta
     print("=" * 72)
     print("  ClusterPulse — живой скорер")
     print(f"  модель: {m['trained_on']}, проверка на отложенной неделе AUC {m['holdout']['auc']:.3f}")
     print(f"  🔴 от {sc.model.red:.2f} (точность на проверке {m['precision_at']['p98']:.0%}), "
           f"🟡 от {sc.model.yellow:.2f} ({m['precision_at']['p90']:.0%}); база {m['holdout']['base']:.0%}")
-    print(f"  решение через {DECIDE_AFTER:.0f} с после создания | Telegram: {'вкл' if sc.tg.on else 'выкл'}")
+    print(f"  решение через {DECIDE_AFTER:.0f} с после создания | Telegram: {'вкл' if sc.tg.on else 'выкл'} "
+          f"({ALERT_LANG}) | источник: {sc.source}")
     print("=" * 72)
     try:
         if a.replay:
             run_replay(sc, a.replay)
+        elif src_kind == "mirage":
+            asyncio.run(run_mirage(sc, sid, a.record, a.record_max))
         else:
             asyncio.run(run_live(sc, a.record, a.record_max))
     except KeyboardInterrupt:
