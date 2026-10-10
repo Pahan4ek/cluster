@@ -183,6 +183,26 @@ class Telegram:
         if self.on:
             threading.Thread(target=self._loop, daemon=True).start()
 
+    def check(self):
+        """Бот видит канал и может в нём писать? Ничего не постит."""
+        if not self.on:
+            return
+        import requests
+        api = f"https://api.telegram.org/bot{self.token}"
+        try:
+            ch = requests.get(f"{api}/getChat", params={"chat_id": self.chat}, timeout=10).json()
+            if not ch.get("ok"):
+                print(f"[TG] ERR: {ch.get('description')} — check TG_CHAT_ID and that the bot is in the channel")
+                return
+            me = requests.get(f"{api}/getChatMember", params={"chat_id": self.chat,
+                              "user_id": self.token.split(":")[0]}, timeout=10).json()
+            st = (me.get("result") or {}).get("status")
+            ok = st in ("administrator", "creator")
+            print(f"[TG] {'OK' if ok else 'ERR'}: channel '{ch['result'].get('title')}', bot status: {st}"
+                  + ("" if ok else " — make the bot an admin with 'Post messages'"))
+        except Exception as e:
+            print(f"[TG] check failed: {type(e).__name__}: {str(e).split('/bot')[0]}")
+
     def send(self, text):
         if not self.on:
             return
@@ -526,12 +546,12 @@ async def run_mirage(sc, sid, record, record_max, give_up=None):
     rec = open(record, "a", encoding="utf-8") if record else None
     written = 0
     last_tick = last_rep = 0.0
-    backoff, fails = 2, 0
+    backoff, rejects = 2, 0
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_size=64 * 2**20) as ws:
                 print(f"[..] connected to Solami Mirage, subscription {sid[:8]}… (full transactions, no refetch)")
-                backoff, fails = 2, 0
+                backoff, rejects = 2, 0
                 while True:
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -570,9 +590,13 @@ async def run_mirage(sc, sid, record, record_max, give_up=None):
                     1001: "(Solami node restart)"}.get(code, "")
             print(f"[MIRAGE] {type(e).__name__}: {_hide(str(e))[:200]} {hint} — reconnecting in {backoff} s")
             sc.mark_gap()
-            fails += 1
-            if give_up and fails >= give_up:       # например, кончился пробный Pro у Solami
-                print(f"[MIRAGE] {fails} failed connects in a row — switching to logsSubscribe")
+            # сдаёмся, только когда Solami отказывает (кончился пробный Pro, ключ отозван),
+            # а не когда пропал интернет: тогда Helius недоступен точно так же
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+            if status in (401, 402, 403) or code == 4002:
+                rejects += 1
+            if give_up and rejects >= give_up:
+                print(f"[MIRAGE] Solami rejected {rejects} connects in a row — switching to logsSubscribe")
                 return
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
@@ -633,6 +657,8 @@ def main():
         else:
             sc.source = "Solami WS" if ("solami" in ws_url()) else "WebSocket"
     m = sc.model.meta
+    if not a.replay:
+        sc.tg.check()
     print("=" * 72)
     print("  ClusterPulse — live pump.fun launch risk scorer")
     print(f"  model: census {m['trained_on']}, held-out week AUC {m['holdout']['auc']:.3f}")
@@ -652,7 +678,7 @@ def main():
         if a.replay:
             run_replay(sc, a.replay)
         elif src_kind == "mirage":
-            asyncio.run(run_mirage(sc, sid, a.record, a.record_max, give_up=8 if a.source == "auto" else None))
+            asyncio.run(run_mirage(sc, sid, a.record, a.record_max, give_up=3 if a.source == "auto" else None))
             if a.source == "auto":
                 if os.environ.get("HELIUS_API_KEY") and not os.environ.get("WS_URL"):
                     os.environ["SOLAMI_API_KEY"] = ""      # Solami не отвечает: logsSubscribe через Helius

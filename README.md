@@ -71,7 +71,7 @@ flowchart LR
 
 The first version used `logsSubscribe`. Busy pump.fun transactions can exceed the log limit and arrive as `Log truncated`, with the events cut off. In our recorded mainnet sample that happened to 0.7% of transactions. Every such transaction needed a `getTransaction` refetch, which costs seconds and RPC credits, exactly where the 10-second window is tight. Mirage delivers the whole transaction, inner instructions included, so the events are never truncated and nothing needs refetching. The filter lives on Solami's side, and the client is just a WebSocket.
 
-Mirage is the default source whenever `SOLAMI_API_KEY` is set. If it is unreachable, the scorer falls back to `logsSubscribe` (Solami WebSocket or Helius) with refetch.
+Mirage is the default source whenever `SOLAMI_API_KEY` is set. If the internet drops, the scorer keeps reconnecting to Mirage and marks the gap. If Solami rejects the key (a trial ended, say), it falls back to `logsSubscribe` (Solami WebSocket or Helius) with refetch.
 
 Measured on mainnet (`tools/solami_check.py`, 40 s, 10.10.2026): 2,540 pump.fun transactions (about 63 per second) carried 1,932 events, including 20 launches. The first frame arrived 0.4 s after connecting, and the median lag from block time to decoded event was 1.8 s. Block time only has whole-second resolution, so this number is rough.
 
