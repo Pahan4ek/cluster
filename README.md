@@ -73,6 +73,8 @@ The first version used `logsSubscribe`. Busy pump.fun transactions can exceed th
 
 Mirage is the default source whenever `SOLAMI_API_KEY` is set. If it is unreachable, the scorer falls back to `logsSubscribe` (Solami WebSocket or Helius) with refetch.
 
+Measured on mainnet (`tools/solami_check.py`, 40 s, 10.10.2026): 2,540 pump.fun transactions (about 63 per second) carried 1,932 events, including 20 launches. The first frame arrived 0.4 s after connecting, and the median lag from block time to decoded event was 1.8 s. Block time only has whole-second resolution, so this number is rough.
+
 `tests/test_mirage.py` replays a recorded mainnet stream through both paths. 6,712 transactions decode to identical events, and the full scorer produces identical scores.
 
 ## Quick start

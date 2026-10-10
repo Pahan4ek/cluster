@@ -26,14 +26,17 @@ def hide(t):
     return str(t).replace(KEY, "<key>")
 
 
-r = requests.post(mirage.RPC.format(key=KEY), json={"jsonrpc": "2.0", "id": 1, "method": "getSlot"}, timeout=15)
-print(f"[RPC] getSlot -> {r.status_code} {hide(r.text[:120])}")
+try:
+    r = requests.post(mirage.RPC.format(key=KEY), json={"jsonrpc": "2.0", "id": 1, "method": "getSlot"}, timeout=15)
+    print(f"[RPC] getSlot -> {r.status_code} {hide(r.text[:120])}")
+except Exception as e:                      # в тексте ошибки requests есть URL с ключом
+    print(f"[RPC] {type(e).__name__}: {hide(e)[:300]}")
 
 try:
     sid = mirage.ensure_subscription(KEY)
     print(f"[MIRAGE] подписка {sid}")
 except Exception as e:
-    sys.exit(f"[MIRAGE] {hide(e)}")
+    sys.exit(f"[MIRAGE] {type(e).__name__}: {hide(e)[:400]}")
 
 
 async def stream():
@@ -69,4 +72,7 @@ async def stream():
     if not ev:
         print("[!] событий pump нет — пришли мне вывод, разберёмся")
 
-asyncio.run(stream())
+try:
+    asyncio.run(stream())
+except Exception as e:
+    sys.exit(f"[MIRAGE] {type(e).__name__}: {hide(e)[:400]}")
