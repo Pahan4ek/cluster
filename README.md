@@ -16,7 +16,7 @@ ClusterPulse answers that question. It watches the pump.fun program in real time
 └ https://pump.fun/coin/<mint>
 ```
 
-Live channel: **TODO: t.me/…** · Demo video: **TODO** · Built for Colosseum Crypto World's Fair (Solana track) and the Solami sidetrack.
+Live channel: **[t.me/cluster_solana](https://t.me/cluster_solana)** · Demo video: **TODO** · Built for Colosseum Crypto World's Fair (Solana track) and the Solami sidetrack.
 
 ## Does it work? Held-out backtest
 
