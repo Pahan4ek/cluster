@@ -65,7 +65,7 @@ flowchart LR
 2. **Decode.** `live/mirage.py` reads the protobuf by hand, without protoc or generated code. It pulls the pump.fun `CreateEvent`, `TradeEvent` and `CompleteEvent` out of the `emit_cpi` inner instructions and resolves address-lookup-table accounts.
 3. **Features.** For each launch: first-block supply split between dev and others, buyers and multi-wallet transactions in slots 0–5, net supply bought in 10 s, the dev's launches and graduations over 30 days, same-ticker launches in the last 30 minutes, and mayhem mode. Every definition mirrors the Dune SQL the model was trained on (`retro/census.sql`), so live inputs match training inputs.
 4. **Score.** A HistGradientBoosting model, exported to JSON and evaluated in pure Python, with no sklearn in production. Red is the top 2% of scores, yellow the next 8%.
-5. **Outcome.** Every launch is followed until it goes quiet. Graduation, retail SOL in and out, and the dev's PnL are stored, so the live backtest builds itself.
+5. **Outcome.** Every launch is followed until it goes quiet. Graduation, retail SOL in and out, and the dev's PnL are stored, so the live backtest builds itself. Every red alert in the channel then gets a reply with what actually happened (retail in/out, graduated or not, dev PnL, trap or not), so anyone can check the calls, misses included.
 
 ### Why Solami Mirage
 

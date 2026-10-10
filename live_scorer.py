@@ -180,6 +180,7 @@ class Telegram:
         self.chat = os.environ.get("TG_CHAT_ID")
         self.on = bool(self.token and self.chat)
         self.q = queue.Queue(maxsize=200)
+        self.sent = {}                 # mint -> message_id алерта: на него отвечаем исходом
         if self.on:
             threading.Thread(target=self._loop, daemon=True).start()
 
@@ -203,11 +204,12 @@ class Telegram:
         except Exception as e:
             print(f"[TG] check failed: {type(e).__name__}: {str(e).split('/bot')[0]}")
 
-    def send(self, text):
-        if not self.on:
+    def send(self, text, mint=None, reply_to=None):
+        """text — HTML. mint: запомнить message_id под этим минтом; reply_to: ответить на алерт этого минта."""
+        if not self.on or (reply_to and reply_to not in self.sent):
             return
         try:
-            self.q.put_nowait(text)
+            self.q.put_nowait((text, mint, reply_to))
         except queue.Full:
             print("    [TG] очередь переполнена, алерт пропущен")
 
@@ -215,14 +217,21 @@ class Telegram:
         import requests
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         while True:
-            text = self.q.get()
+            text, mint, reply_to = self.q.get()
+            body = {"chat_id": self.chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+            if reply_to:
+                body["reply_parameters"] = {"message_id": self.sent[reply_to], "allow_sending_without_reply": True}
             for _ in range(3):
                 try:
-                    r = requests.post(url, json={"chat_id": self.chat, "text": text,
-                                                 "disable_web_page_preview": True}, timeout=10)
+                    r = requests.post(url, json=body, timeout=10)
                     if r.status_code == 429:           # лимит Telegram: ждём, сколько сказали
                         time.sleep(r.json().get("parameters", {}).get("retry_after", 5))
                         continue
+                    j = r.json()
+                    if not j.get("ok"):
+                        print(f"    [TG] ERR {r.status_code}: {j.get('description')}")
+                    elif mint:
+                        self.sent[mint] = j["result"]["message_id"]
                     break
                 except Exception as e:
                     print(f"    [TG] не отправилось: {str(e).split('/bot')[0]}")
@@ -412,19 +421,39 @@ class Scorer:
                     f"| {L.mint} | {txt or 'combination of signals'}")
             print(line)
             if active:
-                self.tg.send(self.alert_text(L, p, reasons))
+                self.tg.send(self.alert_text(L, p, reasons), mint=L.mint)
 
     def alert_text(self, L, p, reasons):
+        from html import escape as e
         base = self.model.meta["base_rate"]
+        m = L.mint
+        links = (f'<a href="https://pump.fun/coin/{m}">pump.fun</a> · <a href="https://gmgn.ai/sol/token/{m}">gmgn</a>'
+                 f' · <code>{m[:4]}…{m[-4:]}</code>')
         if ALERT_LANG == "ru":
-            txt = "\n".join(f"├ {REASON_TEXT[k](v)} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
-            return (f"🔴 ${L.symbol} — риск {p:.0%} (база {base:.0%})\n{txt or '├ комбинация признаков'}\n"
-                    f"└ https://pump.fun/coin/{L.mint}")
-        txt = "\n".join(f"├ {REASON_TEXT_EN[k](v)} — {r:.0%} of such launches were traps" for k, v, r in reasons)
-        return (f"🔴 ${L.symbol} — trap risk {p:.0%} (market base {base:.0%})\n"
+            txt = "\n".join(f"├ {e(REASON_TEXT[k](v))} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
+            return f"🔴 <b>${e(L.symbol)}</b> — риск {p:.0%} (база {base:.0%})\n{txt or '├ комбинация признаков'}\n└ {links}"
+        txt = "\n".join(f"├ {e(REASON_TEXT_EN[k](v))} — {r:.0%} of such launches were traps" for k, v, r in reasons)
+        return (f"🔴 <b>${e(L.symbol)}</b> — trap risk {p:.0%} (market base {base:.0%})\n"
                 f"{txt or '├ combination of signals'}\n"
-                f"├ scored {self.now() - L.seen_at:.0f} s after creation · source: {self.source}\n"
-                f"└ https://pump.fun/coin/{L.mint}")
+                f"├ scored {self.now() - L.seen_at:.0f} s after creation · {e(self.source)}\n"
+                f"└ {links}")
+
+    def outcome_text(self, L, o):
+        """Ответ на алерт, когда запуск затих: что на самом деле стало с деньгами розницы."""
+        sp, net = o["rest_spent"], o["rest_net"]
+        hrs = max((o["last_ts"] - L.ts) / 3600, 0)
+        if sp < 1:
+            verdict = "⚪ too little retail money to judge"
+            money = f"retail put only {sp:.2f} SOL"
+        else:
+            roi = net / sp
+            trap = (not o["graduated"]) and roi < -0.5
+            verdict = "✅ trap: the alert was right" if trap else (
+                "🟢 graduated to AMM: not a trap by our definition" if o["graduated"] else "⚪ not a trap: retail lost less than half")
+            money = f"retail put {sp:.1f} SOL, took out {sp + net:.1f} ({roi:+.0%})"
+        dev = f"dev {o['dev_net']:+.1f} SOL"
+        return (f"↳ <b>outcome</b> (last trade {hrs:.1f} h after launch): {money} · "
+                f"{'graduated' if o['graduated'] else 'never graduated'} · {dev}\n{verdict}")
 
     def stage2(self, L):
         s = L.features_5m()
@@ -443,6 +472,8 @@ class Scorer:
 
     def close(self, L, why):
         o = L.outcome(self.is_bot)
+        if why in ("silent", "age") and not L.gap:
+            self.tg.send(self.outcome_text(L, o), reply_to=L.mint)
         self.db.execute("insert or replace into outcomes values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (L.mint, int(o["graduated"]), o["t_grad"], o["last_ts"], o["n_tr"], o["n_wal"],
                          o["peak_mc"], o["rest_n"], o["rest_spent"], o["rest_net"], o["l5_spent"],
