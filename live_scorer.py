@@ -103,9 +103,12 @@ REASON_TEXT = {
 
 
 REASON_TEXT_EN = {
-    "dev_supply": lambda v: f"dev bought {v:.0%} of supply in the first block",
-    "nondev_s0": lambda v: f"other wallets bought {v:.0%} of supply in the first block",
-    "s2_supply": lambda v: f"{v:.0%} of supply bought in the first 3 slots",
+    "dev_supply": lambda v: f"dev bought {v:.0%} of supply in the first block" if v >= 0.005
+                            else "dev bought nothing in the first block",
+    "nondev_s0": lambda v: f"other wallets bought {v:.0%} of supply in the first block" if v >= 0.005
+                           else "no other wallets in the first block",
+    "s2_supply": lambda v: f"{v:.0%} of supply bought in the first 3 slots" if v >= 0.005
+                           else "almost nobody bought in the first 3 slots",
     "s0_buyers": lambda v: f"{v:.0f} non-dev buyers in the first block",
     "multi_tx": lambda v: f"{v:.0f} multi-wallet transactions at launch",
     "max_wal_per_tx": lambda v: f"up to {v:.0f} wallets in one transaction",
@@ -115,7 +118,7 @@ REASON_TEXT_EN = {
     "comp_before": lambda v: f"{v:.0f} launches with this ticker in 30 min",
     "mayhem": lambda v: "mayhem mode",
     "n_wal_10s": lambda v: f"{v:.0f} wallets in 10 s",
-    "net_supply_10s": lambda v: f"{v:.0%} net supply bought in 10 s",
+    "net_supply_10s": lambda v: f"{v:.0%} net supply bought in 10 s" if v > 0 else "net selling in the first 10 s",
 }
 
 
@@ -638,6 +641,13 @@ def main():
     print(f"  decision {DECIDE_AFTER:.0f} s after creation | Telegram: {'on' if sc.tg.on else 'off'} "
           f"({ALERT_LANG}) | source: {sc.source}")
     print("=" * 72)
+    if sys.platform == "win32":
+        # закрытие окна консоли приходит как SIGBREAK: успеваем записать исходы, как по Ctrl+C
+        import signal
+
+        def _on_close(*_):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGBREAK, _on_close)
     try:
         if a.replay:
             run_replay(sc, a.replay)

@@ -43,8 +43,11 @@ s2 = q("select count(*), sum(flag is not null) from stage2 s join scores using(m
 print(f"5-minute stage: {s2[0]:,}, flag 'all early buyers called pump directly': {s2[1] or 0}")
 
 rows = q("""select s.level, o.graduated, o.rest_spent, o.rest_net
-            from scores s join outcomes o using(mint) where s.c_ts >= ? and o.closed != 'gap'""", since)
-print(f"\nclosed outcomes: {len(rows):,} (launch quiet for 1 h or older than 24 h; stream gaps excluded)")
+            from scores s join outcomes o using(mint)
+            where s.c_ts >= ? and o.closed != 'gap'
+              and (o.closed != 'shutdown' or o.at - s.c_ts >= 3600)""", since)
+print(f"\nclosed outcomes: {len(rows):,} (quiet for 1 h or older than 24 h; stream gaps and launches cut short "
+      f"by a restart excluded)")
 agg = defaultdict(lambda: {"n": 0, "money": 0, "trap": 0, "sp": 0.0, "net": 0.0, "grad": 0})
 for lvl, g, sp, net in rows:
     x = agg[lvl]; x["n"] += 1; x["grad"] += g
