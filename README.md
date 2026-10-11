@@ -42,6 +42,18 @@ How to read the table:
 - Even green launches lose retail money on average. Pump.fun is negative-sum for late buyers. The score tells you where the losses are concentrated, not where the profit is.
 - A live backtest from the 24/7 scorer runs alongside: `python live_report.py`.
 
+### Live, on mainnet
+
+First 9.3 hours of the 24/7 scorer on 11.10.2026 (Solami Mirage, non-mayhem model): 8,197 launches scored, 6,136 followed to their outcome. Only launches where retail put in at least 1 SOL are counted.
+
+| Level | Launches | Trap rate | Retail ROI (SOL in) |
+|---|---:|---:|---:|
+| 🔴 red | 42 | 50.0% | −36.4% (1,494) |
+| 🟡 yellow | 166 | 19.9% | −24.2% (8,103) |
+| 🟢 green | 1,393 | 3.7% | −14.1% (51,580) |
+
+Live base rate 6.6%, so red runs at 7.6× the base. 42 red launches is a small sample, and the numbers will move as the scorer keeps running. Every one of these calls, and its outcome, is public in the channel.
+
 ## What we learned (and why the name is half wrong)
 
 We started as a wallet-cluster detector. The data disagreed:
@@ -53,6 +65,25 @@ We started as a wallet-cluster detector. The data disagreed:
 
 So the product is the risk score. Cluster and bundle signals are its explanations. Numbers: `model/fork_a.txt`.
 
+And then the live data showed us where clusters do matter: **in the outcome itself.** "Retail" in our label is every non-dev wallet that bought after slot 5. A dev's own bundle wallets, the ones painting the chart with small buys, land in that bucket too, and their break-even trades hide what real people lost. So every red alert now gets a funding check five minutes in (below), and the outcome reply reports real buyers separately.
+
+## Funding check: who is actually buying
+
+Five minutes after a red alert, ClusterPulse takes up to 40 early buyers and finds who funded each of them: the last incoming SOL transfer (≥ 0.01 SOL) before their first buy, through Solami RPC (`live/funding.py`). Then:
+
+- **Dev's cluster**: wallets funded by the dev, by the dev's own funder, or by each other.
+- **Shared-funder group**: 3+ early buyers fed by one wallet that is neither an exchange (Dune CEX labels) nor a hub (1,000+ transactions a day).
+- **Links to other launches**: the dev's funder is itself a dev in our 2M-launch history; the same group funder fed early buyers of another launch earlier.
+
+The result goes out as a second reply under the alert. When the launch goes quiet, the outcome reply splits money into all retail versus *real buyers outside the dev's cluster*. Wallets that sold without ever buying on the curve, meaning they received tokens by transfer, count as insiders too.
+
+What it found on the first night:
+
+- **$P- and $NUBI were one operator.** The P- dev wallet got 22.6 SOL from the NUBI dev wallet minutes before launch, so it only looked like a "fresh dev". In both launches one wallet (`6vae…qxWx`) funded most of the early buyers: 25 of 37 in P-, 21 of 36 in NUBI. Those bundle wallets lost 8% and 25%, the cost of running volume. The dev made +14% and +44%.
+- **"Retail −2%" was really −73%.** In $PIN, 39 early buyers shared one funder and carried almost all the "retail" volume (32 SOL in, 31.4 out). The real buyers outside that group put 1.1 SOL in and got 0.3 back. The same pattern shows up in $MAPS (−7% vs −33%) and $SWISH (−4% vs −41%).
+
+Re-run the check for any past launch: `python tools/funding_check.py <mint>` (needs an RPC key). It also prints full PnL for the dev, the cluster, the groups and everyone else.
+
 ## How it works
 
 ```mermaid
@@ -62,7 +93,9 @@ flowchart LR
   C --> D[live/state.py<br/>per-launch state,<br/>10-second feature window]
   D --> E[live/model.py<br/>gradient-boosted trees, 12 features]
   E -->|red| F[Telegram channel]
-  E --> G[(live.db<br/>scores · 5-min stage · outcomes)]
+  E -->|red, +5 min| K[live/funding.py<br/>who funded the early buyers<br/>Solami RPC]
+  K -->|reply: dev cluster| F
+  E --> G[(live.db<br/>scores · funding · outcomes)]
   H[(devdb.sqlite<br/>2M launches, dev history)] --> D
   I[Dune census<br/>retro/] -->|train_live.py| E
 ```
@@ -71,7 +104,8 @@ flowchart LR
 2. **Decode.** `live/mirage.py` reads the protobuf by hand, without protoc or generated code. It pulls the pump.fun `CreateEvent`, `TradeEvent` and `CompleteEvent` out of the `emit_cpi` inner instructions and resolves address-lookup-table accounts.
 3. **Features.** For each launch: first-block supply split between dev and others, buyers and multi-wallet transactions in slots 0–5, net supply bought in 10 s, the dev's launches and graduations over 30 days, and same-ticker launches in the last 30 minutes. Every definition mirrors the Dune SQL the model was trained on (`retro/census.sql`), so live inputs match training inputs.
 4. **Score.** A HistGradientBoosting model, exported to JSON and evaluated in pure Python, with no sklearn in production. Red is the top 2% of scores, yellow the next 8%.
-5. **Outcome.** Every launch is followed until it goes quiet. Graduation, retail SOL in and out, and the dev's PnL are stored, so the live backtest builds itself. Every red alert in the channel then gets a reply with what actually happened (retail in/out, graduated or not, dev PnL, trap or not), so anyone can check the calls, misses included.
+5. **Funding check** for red alerts at +5 minutes (section above).
+6. **Outcome.** Every launch is followed until it goes quiet. Graduation, retail SOL in and out, and the dev's PnL are stored, so the live backtest builds itself. Every red alert in the channel then gets a reply with what actually happened (retail in/out, graduated or not, dev PnL, trap or not), so anyone can check the calls, misses included.
 
 ### Why Solami Mirage
 
@@ -133,10 +167,10 @@ python tools/backtest_table.py                     # held-out table -> model/bac
 | Path | What |
 |---|---|
 | `live_scorer.py` | Live scorer: stream, timers, alerts, SQLite |
-| `live/` | `mirage.py` (Solami Mirage), `pump_events.py` (pump.fun IDL decoding), `state.py` (features), `model.py` (inference), `devdb.py` (dev history) |
+| `live/` | `mirage.py` (Solami Mirage), `pump_events.py` (pump.fun IDL decoding), `state.py` (features), `model.py` (inference), `devdb.py` (dev history), `funding.py` (who funded the early buyers) |
 | `retro/` | Dune SQL and the training pipeline |
 | `model/` | Production model, held-out backtest, fork-A analysis |
-| `tools/` | Solami smoke test, backtest table |
+| `tools/` | Solami smoke test, funding check for one launch, backtest table |
 | `tests/` | Offline tests |
 | `legacy/` | Pre-hackathon code (see below) |
 | `docs/archive/` | Early concept documents. Their latency and architecture claims are outdated |
@@ -145,8 +179,10 @@ python tools/backtest_table.py                     # held-out table -> model/bac
 
 - **AMM phase is not tracked.** A token that graduates counts as "not a trap", even if it dumps on the AMM afterwards.
 - **pump.fun only, SOL-quoted launches only.** Other launchpads (Meteora DBC, LaunchLab) are next.
-- **Research, not yet in production:** a wallet *organicity index* (how much of a buyer's balance went through real price risk in the last 30 days) and funding-graph links (common funder, synchronized top-ups). They may matter more for anti-sybil filtering than for rug prediction.
-- **Next:** a second-stage alert at 5 minutes, a JSON/WebSocket feed for trading bots, and on-chain score attestations that any program can read.
+- **The funding check is one hop.** Bundles funded through exchanges, mixers or several hops are not linked yet, and on most red launches it finds no cluster at all. Each check costs about 100 RPC calls.
+- **The model was trained on the contaminated retail label.** Retraining on "real buyers" needs the funding check run over the historical census. That is the next step, and we expect it to raise the red trap rate.
+- **Research, not yet in production:** a wallet *organicity index* (how much of a buyer's balance went through real price risk in the last 30 days). It may matter more for anti-sybil filtering than for rug prediction.
+- **Next:** a JSON/WebSocket feed for trading bots, and on-chain score attestations that any program can read.
 
 ## Prior work disclosure
 
