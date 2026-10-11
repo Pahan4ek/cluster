@@ -284,6 +284,7 @@ class Scorer:
         # проверка пополнений ранних покупателей у красных алертов: в фоне, через RPC
         self.fund_pool = self.fund_rpc = None
         self.fund_done = queue.Queue()
+        self.funder_seen = {}        # пополнитель -> [(символ, сколько ранних покупателей пополнил, ts)]
         if not replay and os.environ.get("FUNDING", "1") != "0" and fundmod.rpc_url():
             from concurrent.futures import ThreadPoolExecutor
             self.fund_rpc = fundmod.RPC()
@@ -463,10 +464,39 @@ class Scorer:
                   f"other groups {len(r['groups'])} | rpc {self.fund_rpc.calls:,}")
             if L is not None:
                 L.funding = r
-            self.tg.send(self.funding_text(r), reply_to=mint)
+            self.tg.send(self.funding_text(r, self.funding_context(L, r)), reply_to=mint)
+
+    def funding_context(self, L, r):
+        """Связи с другими запусками: пополнитель дева сам запускал токены; тот же пополнитель у других запусков."""
+        out = []
+        now = self.now()
+        di = r["dev_info"]
+        f = di.get("funder")
+        if f and L is not None:
+            n30, _ = self.devdb.history(f, L.ts)
+            if n30:
+                cid = self.devdb._cid(f, create=False)
+                row = self.devdb.conn.execute("select mint from launches where creator_id=? and ts<? and mint is not null "
+                                              "order by ts desc limit 1", (cid, L.ts)).fetchone()
+                sym = self.db.execute("select symbol from scores where mint=?", (row[0],)).fetchone() if row else None
+                age = f"{(L.ts - di['fund_ts']) / 60:.0f} min" if di.get("fund_ts") else "shortly"
+                out.append(f"the dev wallet was funded {age} before launch by a wallet that launched {n30} "
+                           f"token{'s' if n30 != 1 else ''} in 30 days" + (f" (last: ${sym[0]})" if sym else ""))
+        groups = [(g["funder"], len(g["wallets"])) for g in r["groups"]]
+        for g, n in groups:
+            seen = self.funder_seen.get(g, [])
+            if seen:
+                sym, k, ts = seen[-1]
+                out.append(f"the same funder {g[:4]}…{g[-4:]} fed {k} early buyers of ${sym} {(now - ts) / 60:.0f} min ago"
+                           + (f" and {len(seen) - 1} more launches" if len(seen) > 1 else ""))
+        for g, n in groups:
+            self.funder_seen.setdefault(g, []).append((L.symbol if L else "?", n, now))
+        if len(self.funder_seen) > 50_000:
+            self.funder_seen.clear()
+        return out
 
     @staticmethod
-    def funding_text(r):
+    def funding_text(r, extra=()):
         n, c = r["n"], len(r["cluster"])
         rows = []
         if c:
@@ -475,7 +505,9 @@ class Scorer:
         else:
             rows.append(f"no funding links to the dev among {n} early buyers")
         for g in r["groups"][:2]:
-            rows.append(f"{len(g['wallets'])} more share one funder {g['funder'][:4]}…{g['funder'][-4:]}")
+            rows.append(f"{len(g['wallets'])} {'more' if c else f'of {n} early buyers'} share one funder "
+                        f"{g['funder'][:4]}…{g['funder'][-4:]}")
+        rows += list(extra)
         rows.append(f"{r['fresh']} of {n} were fresh wallets (≤2 transactions before buying)")
         return "↳ <b>5-min funding check</b>\n" + "\n".join(f"├ {x}" for x in rows[:-1]) + f"\n└ {rows[-1]}"
 
@@ -583,7 +615,8 @@ class Scorer:
         o_real = None
         if L.funding:
             linked = L.funding["cluster"] | L.funding["group_wallets"]
-            o_real = L.outcome(lambda u: self.is_bot(u) or u in linked)
+            # кто продавал, ничего не купив на кривой, получил токены переводом — тоже свои
+            o_real = L.outcome(lambda u: self.is_bot(u) or u in linked or L.wallets[u][2] < 0.001)
             self.db.execute("update funding set real_spent=?, real_net=? where mint=?",
                             (o_real["rest_spent"], o_real["rest_net"], L.mint))
         if why in ("silent", "age") and not L.gap:

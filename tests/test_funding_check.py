@@ -45,6 +45,7 @@ def transfer(src, dst, lam):
 
 class FakeRPC:
     calls = errors = 0
+    last_err = None
 
     def sigs(self, addr, before=None, limit=1000):
         if addr == mint:

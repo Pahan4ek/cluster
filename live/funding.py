@@ -51,6 +51,7 @@ class RPC:
         rps = rps or float(os.environ.get("FUNDING_RPS", 40))
         self.min_dt, self.last = 1.0 / rps, 0.0
         self.calls = self.errors = 0
+        self.last_err = None                 # для диагностики: последняя ошибка RPC (без ключа)
 
     def call(self, method, params, tries=3):
         for i in range(tries):
@@ -64,16 +65,19 @@ class RPC:
                                 timeout=20)
                 self.calls += 1
                 if r.status_code == 429:
+                    self.last_err = "HTTP 429"
                     time.sleep(1 + i)
                     continue
                 j = r.json()
                 if "error" in j:
                     self.errors += 1
+                    self.last_err = f"{method}: {str(j['error'])[:200]}"
                     time.sleep(0.3 * (i + 1))
                     continue
                 return j.get("result")
-            except Exception:
+            except Exception as e:
                 self.errors += 1
+                self.last_err = f"{method}: {type(e).__name__}: {str(e).split('api_key=')[0].split('api-key=')[0][:150]}"
                 time.sleep(0.5 * (i + 1))
         return None
 
