@@ -95,7 +95,7 @@ def init(self):
     self.db = sqlite3.connect(tmp / "live.db"); self.db.executescript(live_scorer.SCHEMA)
     self.wal_launches = {}
     self.tickers = live_scorer.TickerWindow(); self.tickers.add_and_count("test", m(pk(90)), T0 - 60)
-    self.launches, self.comp, self.pending = {}, {}, {}
+    self.launches, self.comp, self.pending, self.skip = {}, {}, {}, set()
     from collections import deque
     self.refetch, self.can_refetch = deque(), False
     self.tg = live_scorer.Telegram(); self.tg.on = False

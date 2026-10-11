@@ -14,6 +14,7 @@ copaid_w5 выкинут: в логах нет подписанта транза
     python retro/train_live.py                 -> model/live_model_new.json (+ model/fork_a.txt)
     python retro/train_live.py --target old    выбрать цель вручную (old | new), по умолчанию — стабильнее по неделям
     python retro/train_live.py --out model/live_model.json   сразу в бой (скорер читает этот файл)
+    python retro/train_live.py --no-mayhem     без запусков в режиме mayhem: их скорер не трогает вовсе
 
 Цели:
   old — розница на НЕ вышедшем токене теряет больше половины денег (ROI < -50%);
@@ -162,7 +163,13 @@ def dirty_mayhem(lines):
 def main():
     arg = lambda k, dflt=None: sys.argv[sys.argv.index(k) + 1] if k in sys.argv else dflt
     out_path = Path(arg("--out", MODEL_DIR / "live_model_new.json"))
+    no_mayhem = "--no-mayhem" in sys.argv
     d = load()
+    if no_mayhem:
+        n0 = len(d)
+        d = d[d.mayhem == 0].copy()
+        FEATURES.remove("mayhem"); BINS.pop("mayhem", None)
+        print(f"без mayhem: {len(d):,} из {n0:,} запусков")
     print(f"запусков с внешней розницей: {len(d):,}  ({d.c_time.min():%d.%m}–{d.c_time.max():%d.%m})")
     lines = []
     stab = {}
@@ -180,10 +187,11 @@ def main():
     lines.append(f"выбрана цель: {target} — {TARGETS[target]}")
     d["trap"] = d[f"trap_{target}"]
     lines.append("")
-    fork_a(d, "trap", lines)
-    dirty_mayhem(lines)
+    if not no_mayhem:
+        fork_a(d, "trap", lines)
+        dirty_mayhem(lines)
     print("\n".join(lines))
-    (MODEL_DIR / "fork_a.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (MODEL_DIR / ("train_no_mayhem.txt" if no_mayhem else "fork_a.txt")).write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"доля ловушек: {d.trap.mean():.3f}")
 
     te = d[d.week == 3]
@@ -230,7 +238,7 @@ def main():
             "holdout": {"auc": float(auc), "top10": float(y[top10].mean()), "top2": float(y[top2].mean()),
                         "base": float(y.mean()), "n": int(len(y))},
             "thresholds": q_final, "thresholds_holdout_model": q, "precision_at": prec, "explain": expl, "roi_by_level": roi,
-            "min_retail_sol": MIN_RETAIL_SOL,
+            "min_retail_sol": MIN_RETAIL_SOL, "excludes_mayhem": no_mayhem,
             "trained_on": f"{d.c_time.min():%Y-%m-%d}..{d.c_time.max():%Y-%m-%d}", "n_train": int(len(d))}
     path = out_path
     export(final, path, meta)

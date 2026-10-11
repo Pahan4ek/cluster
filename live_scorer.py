@@ -122,6 +122,26 @@ REASON_TEXT_EN = {
 }
 
 
+NA_TEXT = {   # признак не определён (None): что это значит для человека
+    "en": {"dev_prev_30d": "fresh dev: no launches in the last 30 days",
+           "dev_prev_grad": "fresh dev: no launches in the last 30 days",
+           "dev_grad_rate": "fresh dev: no launches in the last 30 days",
+           "multi_tx": "no multi-wallet transactions at launch",
+           "max_wal_per_tx": "no multi-wallet transactions at launch"},
+    "ru": {"dev_prev_30d": "новый дев: ни одного запуска за 30 дней",
+           "dev_prev_grad": "новый дев: ни одного запуска за 30 дней",
+           "dev_grad_rate": "новый дев: ни одного запуска за 30 дней",
+           "multi_tx": "нет транзакций с несколькими кошельками на старте",
+           "max_wal_per_tx": "нет транзакций с несколькими кошельками на старте"},
+}
+
+
+def reason_text(k, v, lang="en"):
+    if v is None:
+        return NA_TEXT[lang].get(k, f"{k}: no data")
+    return (REASON_TEXT_EN if lang == "en" else REASON_TEXT)[k](v)
+
+
 def _hide(text):
     """Ключи в URL не должны попадать в лог."""
     for k in ("api-key=", "api_key="):
@@ -253,6 +273,7 @@ class Scorer:
         self.launches = {}
         self.comp = {}
         self.pending = {}            # mint -> [(t, ev, slot, sig, outer)]
+        self.skip = set()            # минты, которые не трогаем (mayhem)
         self.refetch = deque()       # (sig, slot) транзакций с обрезанными логами
         self.can_refetch = not replay and bool(rpc_url())
         self.tg = Telegram()
@@ -337,6 +358,12 @@ class Scorer:
         if ev.get("quote_mint", SOL_QUOTE) != SOL_QUOTE:
             self.st["creates_other_quote"] += 1       # модель училась только на котировке в SOL
             return
+        if ev.get("is_mayhem_mode"):
+            # mayhem — торгует агент pump.fun, а не люди: не оцениваем, не алертим, сделки не храним
+            self.st["mayhem_skipped"] = self.st.get("mayhem_skipped", 0) + 1
+            self.skip.add(mint)
+            self.pending.pop(mint, None)
+            return
         self.st["creates"] += 1
         L = Launch(ev, slot, self.now())
         self.launches[mint] = L
@@ -345,6 +372,8 @@ class Scorer:
             self._add(L, tev, tslot, tsig, touter)
 
     def on_trade(self, ev, slot, sig, outer):
+        if ev["mint"] in self.skip:
+            return
         self.st["trades"] += 1
         L = self.launches.get(ev["mint"])
         if L is not None:
@@ -401,9 +430,9 @@ class Scorer:
         lvl = self.model.level(p)
         reasons = [(k, v, r) for k, v, r in self.model.reasons(f)]
         if ALERT_LANG == "ru":
-            txt = "; ".join(f"{REASON_TEXT[k](v)} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
+            txt = "; ".join(f"{reason_text(k, v, 'ru')} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
         else:
-            txt = "; ".join(f"{REASON_TEXT_EN[k](v)} ({r:.0%} traps)" for k, v, r in reasons)
+            txt = "; ".join(f"{reason_text(k, v)} ({r:.0%} traps)" for k, v, r in reasons)
         L.scored, L.score = True, p
         if L.gap:
             lvl = "gap"                # окно 10 с пересекло обрыв: признаки неполные
@@ -430,9 +459,9 @@ class Scorer:
         links = (f'<a href="https://pump.fun/coin/{m}">pump.fun</a> · <a href="https://gmgn.ai/sol/token/{m}">gmgn</a>'
                  f' · <code>{m[:4]}…{m[-4:]}</code>')
         if ALERT_LANG == "ru":
-            txt = "\n".join(f"├ {e(REASON_TEXT[k](v))} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
+            txt = "\n".join(f"├ {e(reason_text(k, v, 'ru'))} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
             return f"🔴 <b>${e(L.symbol)}</b> — риск {p:.0%} (база {base:.0%})\n{txt or '├ комбинация признаков'}\n└ {links}"
-        txt = "\n".join(f"├ {e(REASON_TEXT_EN[k](v))} — {r:.0%} of such launches were traps" for k, v, r in reasons)
+        txt = "\n".join(f"├ {e(reason_text(k, v))} — {r:.0%} of such launches were traps" for k, v, r in reasons)
         return (f"🔴 <b>${e(L.symbol)}</b> — trap risk {p:.0%} (market base {base:.0%})\n"
                 f"{txt or '├ combination of signals'}\n"
                 f"├ scored {self.now() - L.seen_at:.0f} s after creation · {e(self.source)}\n"
@@ -494,7 +523,7 @@ class Scorer:
     def report(self):
         s = self.st
         up = (time.time() - self.started) / 60
-        extra = "".join(f" | {k} {s[k]:,}" for k in ("truncated", "refetch_failed", "errors") if s.get(k))
+        extra = "".join(f" | {k} {s[k]:,}" for k in ("mayhem_skipped", "truncated", "refetch_failed", "errors") if s.get(k))
         print(f"[{time.strftime('%H:%M:%S')}] {up:5.1f} min | tx {s['msgs']:,} | launches {s['creates']:,} "
               f"| trades {s['trades']:,} | graduated {s['completes']} | scored {s['scored']:,} "
               f"(🔴 {s['red']}, 🟡 {s['yellow']}) | in memory {len(self.launches):,}{extra}")
