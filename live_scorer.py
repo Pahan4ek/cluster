@@ -55,6 +55,7 @@ try:
 except ImportError:
     pass
 
+from live import funding as fundmod
 from live import mirage
 from live.devdb import DevDB
 from live.model import Model
@@ -79,6 +80,9 @@ CREATE TABLE IF NOT EXISTS scores (
 CREATE TABLE IF NOT EXISTS stage2 (
     mint TEXT PRIMARY KEY, org_buyers_5m INTEGER, direct_share REAL, top_prog_share REAL,
     n_progs INTEGER, flag TEXT, at INTEGER);
+CREATE TABLE IF NOT EXISTS funding (
+    mint TEXT PRIMARY KEY, n_early INTEGER, n_cluster INTEGER, share_sol REAL, n_fresh INTEGER,
+    n_groups INTEGER, dev_funder TEXT, cluster TEXT, real_spent REAL, real_net REAL, at INTEGER);
 CREATE TABLE IF NOT EXISTS outcomes (
     mint TEXT PRIMARY KEY, graduated INTEGER, t_grad INTEGER, last_ts INTEGER, n_tr INTEGER,
     n_wal INTEGER, peak_mc REAL, rest_n INTEGER, rest_spent REAL, rest_net REAL,
@@ -277,6 +281,14 @@ class Scorer:
         self.refetch = deque()       # (sig, slot) транзакций с обрезанными логами
         self.can_refetch = not replay and bool(rpc_url())
         self.tg = Telegram()
+        # проверка пополнений ранних покупателей у красных алертов: в фоне, через RPC
+        self.fund_pool = self.fund_rpc = None
+        self.fund_done = queue.Queue()
+        if not replay and os.environ.get("FUNDING", "1") != "0" and fundmod.rpc_url():
+            from concurrent.futures import ThreadPoolExecutor
+            self.fund_rpc = fundmod.RPC()
+            self.fund_pool = ThreadPoolExecutor(2)
+            self.cex = fundmod.load_cex()
         self.clock = 0.0             # в режиме replay — время последнего события
         self.started = time.time()
         self.source = "replay" if replay else "?"
@@ -341,13 +353,13 @@ class Scorer:
                 self.clock = max(self.clock, float(ev["timestamp"]))
             k = ev["kind"]
             if k == "create":
-                self.on_create(ev, slot)
+                self.on_create(ev, slot, sig)
             elif k == "trade":
                 self.on_trade(ev, slot, sig, outer)
             elif k == "complete":
                 self.on_complete(ev)
 
-    def on_create(self, ev, slot):
+    def on_create(self, ev, slot, sig=None):
         mint = ev["mint"]
         if mint in self.launches:
             return
@@ -366,6 +378,7 @@ class Scorer:
             return
         self.st["creates"] += 1
         L = Launch(ev, slot, self.now())
+        L.create_sig = sig
         self.launches[mint] = L
         self.comp[mint] = comp
         for _, tev, tslot, tsig, touter in self.pending.pop(mint, ()):
@@ -421,8 +434,50 @@ class Scorer:
                 self.close(L, "silent" if silent > EVICT_SILENT else "age")
         for mint in [m for m, v in self.pending.items() if now - v[0][0] > PENDING_TTL]:
             del self.pending[mint]
+        self.drain_funding()
         self.db.commit()
         self.devdb.commit()
+
+    # ---------- пополнения ранних покупателей ----------
+    def _fund_job(self, mint, dev, buyers, create_sig):
+        try:
+            r = fundmod.analyse(self.fund_rpc, dev, buyers, dev_before_sig=create_sig, cex=self.cex)
+            self.fund_done.put((mint, r, None))
+        except Exception as e:
+            self.fund_done.put((mint, None, f"{type(e).__name__}: {_hide(str(e))[:200]}"))
+
+    def drain_funding(self):
+        q = getattr(self, "fund_done", None)
+        while q is not None and not q.empty():
+            mint, r, err = q.get_nowait()
+            if err:
+                print(f"    [FUND] {mint[:8]}…: {err}")
+                continue
+            L = self.launches.get(mint)
+            cl = sorted(r["cluster"])
+            self.db.execute("insert or replace into funding values (?,?,?,?,?,?,?,?,?,?,?)",
+                            (mint, r["n"], len(cl), r["share_sol"], r["fresh"], len(r["groups"]),
+                             r["dev_info"]["funder"], json.dumps(cl), None, None, int(self.now())))
+            print(f"[{time.strftime('%H:%M:%S')}] 🔎 {(L.symbol if L else mint[:8])[:12]:12s} dev cluster "
+                  f"{len(cl)}/{r['n']} early buyers ({r['share_sol']:.0%} of early SOL), fresh {r['fresh']}, "
+                  f"other groups {len(r['groups'])} | rpc {self.fund_rpc.calls:,}")
+            if L is not None:
+                L.funding = r
+            self.tg.send(self.funding_text(r), reply_to=mint)
+
+    @staticmethod
+    def funding_text(r):
+        n, c = r["n"], len(r["cluster"])
+        rows = []
+        if c:
+            rows.append(f"{c} of {n} early buyers are the dev's wallets (funded by the dev or the dev's funder) — "
+                        f"{r['share_sol']:.0%} of early buy volume")
+        else:
+            rows.append(f"no funding links to the dev among {n} early buyers")
+        for g in r["groups"][:2]:
+            rows.append(f"{len(g['wallets'])} more share one funder {g['funder'][:4]}…{g['funder'][-4:]}")
+        rows.append(f"{r['fresh']} of {n} were fresh wallets (≤2 transactions before buying)")
+        return "↳ <b>5-min funding check</b>\n" + "\n".join(f"├ {x}" for x in rows[:-1]) + f"\n└ {rows[-1]}"
 
     def score(self, L):
         f = L.features_10s(self.devdb, self.comp.get(L.mint, 0))
@@ -433,7 +488,7 @@ class Scorer:
             txt = "; ".join(f"{reason_text(k, v, 'ru')} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
         else:
             txt = "; ".join(f"{reason_text(k, v)} ({r:.0%} traps)" for k, v, r in reasons)
-        L.scored, L.score = True, p
+        L.scored, L.score, L.level = True, p, lvl
         if L.gap:
             lvl = "gap"                # окно 10 с пересекло обрыв: признаки неполные
         lag = self.now() - L.seen_at
@@ -451,6 +506,7 @@ class Scorer:
             print(line)
             if active:
                 self.tg.send(self.alert_text(L, p, reasons), mint=L.mint)
+                L.alerted = self.tg.on
 
     def alert_text(self, L, p, reasons):
         from html import escape as e
@@ -467,22 +523,32 @@ class Scorer:
                 f"├ scored {self.now() - L.seen_at:.0f} s after creation · {e(self.source)}\n"
                 f"└ {links}")
 
-    def outcome_text(self, L, o):
-        """Ответ на алерт, когда запуск затих: что на самом деле стало с деньгами розницы."""
-        sp, net = o["rest_spent"], o["rest_net"]
+    def outcome_text(self, L, o, o_real=None):
+        """Ответ на алерт, когда запуск затих: что на самом деле стало с деньгами розницы.
+        o_real — то же без кошельков кластера дева (если проверка пополнений успела); вердикт — по нему."""
+        def money(x, label):
+            sp, net = x["rest_spent"], x["rest_net"]
+            if sp < 1:
+                return f"{label} put only {sp:.2f} SOL"
+            return f"{label} put {sp:.1f} SOL, took out {sp + net:.1f} ({net / sp:+.0%})"
         hrs = max((o["last_ts"] - L.ts) / 3600, 0)
+        head = (f"↳ <b>outcome</b> (last trade {hrs:.1f} h after launch): {money(o, 'retail')} · "
+                f"{'graduated' if o['graduated'] else 'never graduated'} · dev {o['dev_net']:+.1f} SOL")
+        v = o
+        if o_real is not None:
+            head += "\n├ " + money(o_real, "real buyers outside the dev's cluster")
+            if o_real["rest_spent"] >= 1:
+                v = o_real
+        sp, net = v["rest_spent"], v["rest_net"]
         if sp < 1:
             verdict = "⚪ too little retail money to judge"
-            money = f"retail put only {sp:.2f} SOL"
+        elif o["graduated"]:
+            verdict = "🟢 graduated to AMM: not a trap by our definition"
+        elif net / sp < -0.5:
+            verdict = "✅ trap: the alert was right"
         else:
-            roi = net / sp
-            trap = (not o["graduated"]) and roi < -0.5
-            verdict = "✅ trap: the alert was right" if trap else (
-                "🟢 graduated to AMM: not a trap by our definition" if o["graduated"] else "⚪ not a trap: retail lost less than half")
-            money = f"retail put {sp:.1f} SOL, took out {sp + net:.1f} ({roi:+.0%})"
-        dev = f"dev {o['dev_net']:+.1f} SOL"
-        return (f"↳ <b>outcome</b> (last trade {hrs:.1f} h after launch): {money} · "
-                f"{'graduated' if o['graduated'] else 'never graduated'} · {dev}\n{verdict}")
+            verdict = "⚪ not a trap: retail lost less than half"
+        return f"{head}\n{verdict}"
 
     def stage2(self, L):
         s = L.features_5m()
@@ -490,6 +556,19 @@ class Scorer:
         if s["org_buyers_5m"] >= 5 and (s["direct_share"] or 0) >= 0.99 and not L.gap:
             flag = "all_direct"        # все ранние мимо терминалов: сайт pump.fun или свои скрипты
         L.stage2_done = True
+        if getattr(self, "fund_pool", None) and L.alerted and not L.gap:
+            buyers = {}
+            for rs, rt, sig, user, is_buy, sol, tok, outer in L.trades:
+                if not is_buy or user == L.creator or self.is_bot(user):
+                    continue
+                if user not in buyers:
+                    if len(buyers) >= 40:
+                        continue
+                    buyers[user] = [sig, 0.0]
+                buyers[user][1] += sol
+            if buyers:
+                self.fund_pool.submit(self._fund_job, L.mint, L.creator,
+                                      {w: tuple(v) for w, v in buyers.items()}, L.create_sig)
         L.trades = []                  # первые 5 минут больше не нужны
         self.db.execute("insert or replace into stage2 values (?,?,?,?,?,?,?)",
                         (L.mint, s["org_buyers_5m"], s["direct_share"], s["top_prog_share"],
@@ -501,8 +580,14 @@ class Scorer:
 
     def close(self, L, why):
         o = L.outcome(self.is_bot)
+        o_real = None
+        if L.funding:
+            linked = L.funding["cluster"] | L.funding["group_wallets"]
+            o_real = L.outcome(lambda u: self.is_bot(u) or u in linked)
+            self.db.execute("update funding set real_spent=?, real_net=? where mint=?",
+                            (o_real["rest_spent"], o_real["rest_net"], L.mint))
         if why in ("silent", "age") and not L.gap:
-            self.tg.send(self.outcome_text(L, o), reply_to=L.mint)
+            self.tg.send(self.outcome_text(L, o, o_real), reply_to=L.mint)
         self.db.execute("insert or replace into outcomes values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (L.mint, int(o["graduated"]), o["t_grad"], o["last_ts"], o["n_tr"], o["n_wal"],
                          o["peak_mc"], o["rest_n"], o["rest_spent"], o["rest_net"], o["l5_spent"],

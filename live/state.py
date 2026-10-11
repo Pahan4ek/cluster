@@ -36,7 +36,7 @@ SUPPLY = 1e9
 class Launch:
     __slots__ = ("mint", "creator", "symbol", "name", "slot", "ts", "mayhem", "seen_at",
                  "trades", "scored", "stage2_done", "wallets", "last_ts", "grad_ts", "peak_mc",
-                 "n_tr", "features", "score", "gap")
+                 "n_tr", "features", "score", "gap", "create_sig", "level", "alerted", "funding")
 
     def __init__(self, ev, slot, seen_at):
         self.mint = ev["mint"]
@@ -59,6 +59,10 @@ class Launch:
         self.features = None
         self.score = None
         self.gap = False            # запуск пересёк обрыв WebSocket — сделки неполные
+        self.create_sig = None      # подпись транзакции создания (для поиска пополнителя дева)
+        self.level = None
+        self.alerted = False        # красный алерт ушёл в Telegram
+        self.funding = None         # итог live/funding.analyse по ранним покупателям
 
     def add_trade(self, ev, slot, sig, outer):
         rs = slot - self.slot
