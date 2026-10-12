@@ -21,7 +21,7 @@ Launches in pump.fun's *mayhem mode* are skipped entirely. They are traded by pu
 ✅ trap: the alert was right
 ```
 
-Live channel: **[t.me/cluster_solana](https://t.me/cluster_solana)** · Demo video: **TODO** · Built for Colosseum Crypto World's Fair (Solana track) and the Solami sidetrack.
+Live channel: **[t.me/cluster_solana](https://t.me/cluster_solana)** · Demo video: **[youtu.be/uRgR4BDfGjw](https://youtu.be/uRgR4BDfGjw)** · Pitch: **[youtu.be/-r6rjNmGWyU](https://youtu.be/-r6rjNmGWyU)** · Built for Colosseum Crypto World's Fair (Solana track) and the Solami sidetrack.
 
 ## Does it work? Held-out backtest
 
