@@ -515,7 +515,12 @@ class Scorer:
         f = L.features_10s(self.devdb, self.comp.get(L.mint, 0))
         p = self.model.predict(f)
         lvl = self.model.level(p)
-        reasons = [(k, v, r) for k, v, r in self.model.reasons(f)]
+        reasons, seen = [], set()
+        for k, v, r in self.model.reasons(f):   # разные признаки могут давать одну фразу ("fresh dev") — оставляем первую
+            t = reason_text(k, v)
+            if t not in seen:
+                seen.add(t)
+                reasons.append((k, v, r))
         if ALERT_LANG == "ru":
             txt = "; ".join(f"{reason_text(k, v, 'ru')} (ловушек в такой группе {r:.0%})" for k, v, r in reasons)
         else:

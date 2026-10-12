@@ -44,15 +44,15 @@ How to read the table:
 
 ### Live, on mainnet
 
-First 9.3 hours of the 24/7 scorer on 11.10.2026 (Solami Mirage, non-mayhem model): 8,197 launches scored, 6,136 followed to their outcome. Only launches where retail put in at least 1 SOL are counted.
+Everything the 24/7 scorer has scored live as of 12.10.2026, 19:00 Kyiv: 44,368 launches, 34,610 followed to their outcome (logsSubscribe from 23.09, Solami Mirage from 10.10). Only launches where retail put in at least 1 SOL are counted.
 
 | Level | Launches | Trap rate | Retail ROI (SOL in) |
 |---|---:|---:|---:|
-| 🔴 red | 42 | 50.0% | −36.4% (1,494) |
-| 🟡 yellow | 166 | 19.9% | −24.2% (8,103) |
-| 🟢 green | 1,393 | 3.7% | −14.1% (51,580) |
+| 🔴 red | 110 | 29.1% | −31.3% (5,359) |
+| 🟡 yellow | 943 | 11.7% | −19.2% (37,026) |
+| 🟢 green | 8,572 | 2.5% | −13.0% (317,753) |
 
-Live base rate 6.6%, so red runs at 7.6× the base. 42 red launches is a small sample, and the numbers will move as the scorer keeps running. Every one of these calls, and its outcome, is public in the channel.
+Live base rate 3.7%, so red runs at 7.9× the base and 11.6× green, in line with the held-out Dune week (29.5% for red). 110 red launches is still a small sample. Every one of these calls, and its outcome, is public in the channel.
 
 ## What we learned (and why the name is half wrong)
 
